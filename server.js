@@ -6,7 +6,8 @@ const crypto = require("crypto");
 const app = express();
 app.use(cors());
 // Allow larger JSON bodies to support base64 images
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 
 app.get("/", (req, res) => {
   res.send("🔥 Burner Link API is live");
