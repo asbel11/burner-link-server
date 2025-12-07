@@ -27,6 +27,13 @@ app.get("/", (req, res) => {
 // }
 const sessions = {};
 
+// Simple in-memory metrics (reset when server restarts)
+const metrics = {
+  cameraClicks: 0,
+  sessionsCreated: 0,
+  devices: new Set(), // unique deviceIds we've seen
+};
+
 // Helper to create a random id
 function createId() {
   if (crypto.randomUUID) return crypto.randomUUID();
@@ -48,6 +55,9 @@ app.post("/sessions/create", (req, res) => {
   if (!deviceId || typeof deviceId !== "string") {
     return res.status(400).json({ error: "Missing or invalid deviceId" });
   }
+
+  metrics.sessionsCreated += 1;
+  metrics.devices.add(deviceId);
 
   const sessionId = createId();
 
@@ -73,6 +83,8 @@ app.post("/sessions/join", (req, res) => {
   if (!deviceId || typeof deviceId !== "string") {
     return res.status(400).json({ error: "Missing or invalid deviceId" });
   }
+
+  metrics.devices.add(deviceId);
 
   const entry = Object.entries(sessions).find(
     ([, sess]) => sess.code === code && sess.active
@@ -172,6 +184,42 @@ app.post("/messages", (req, res) => {
     encrypted: msg.encrypted,
     fileName: msg.fileName,
   });
+});
+
+// ---------- Metrics routes ----------
+
+// Record that a user tapped the camera icon in the app
+app.post("/metrics/camera-click", (req, res) => {
+  try {
+    const { deviceId } = req.body || {};
+    metrics.cameraClicks += 1;
+    if (deviceId && typeof deviceId === "string") {
+      metrics.devices.add(deviceId);
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Error in /metrics/camera-click:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get basic stats about usage
+app.get("/metrics/stats", (req, res) => {
+  try {
+    const activeSessions = Object.values(sessions).filter(
+      (s) => s && s.active
+    ).length;
+
+    return res.json({
+      cameraClicks: metrics.cameraClicks,
+      sessionsCreated: metrics.sessionsCreated,
+      activeSessions,
+      approximateUsers: metrics.devices.size,
+    });
+  } catch (err) {
+    console.error("Error in /metrics/stats:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
 });
 
 // ---------- Start server ----------
