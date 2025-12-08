@@ -29,6 +29,7 @@ const sessions = {};
 
 // If one device hasn't checked in for this long, we treat the session as ended (ms)
 const OFFLINE_TIMEOUT_MS = 20000; // 20 seconds
+const INACTIVITY_BEFORE_BURN_MS = 30000; // 30 seconds after last message
 
 // Simple in-memory metrics (reset when server restarts)
 const metrics = {
@@ -71,6 +72,7 @@ app.post("/sessions/create", (req, res) => {
     // creator is first participant
     participants: new Set([deviceId]),
     lastSeen: { [deviceId]: Date.now() },
+    lastMessageAt: Date.now(),
   };
 
   console.log("Created session", sessionId, "for code", code, "by", deviceId);
@@ -192,13 +194,19 @@ app.post("/sessions/heartbeat", (req, res) => {
     session.lastSeen[deviceId] = now;
 
     // If there are at least two participants, check whether the other one
-    // has gone offline for too long. If so, end the session.
+    // has gone offline for too long AND there has been no message activity
+    // for INACTIVITY_BEFORE_BURN_MS. Only then do we end the session.
     const entries = Object.entries(session.lastSeen);
     if (entries.length >= 2) {
       const stale = entries.find(
         ([id, ts]) => id !== deviceId && now - ts > OFFLINE_TIMEOUT_MS
       );
-      if (stale) {
+
+      const inactiveLongEnough =
+        typeof session.lastMessageAt === "number" &&
+        now - session.lastMessageAt > INACTIVITY_BEFORE_BURN_MS;
+
+      if (stale && inactiveLongEnough) {
         session.active = false;
         session.messages = [];
         session.participants = new Set();
@@ -237,6 +245,8 @@ app.post("/messages", (req, res) => {
   if (!session || !session.active) {
     return res.status(404).json({ error: "Session not found or inactive" });
   }
+
+  session.lastMessageAt = Date.now();
 
   if (
     !encrypted ||
