@@ -129,6 +129,32 @@ app.post("/sessions/end", (req, res) => {
   res.json({ ok: true });
 });
 
+// Check basic status of a session (used so the first device can auto-join chat
+// when the second device connects).
+app.get("/sessions/status/:sessionId", (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const session = sessions[sessionId];
+
+    if (!session) {
+      return res.status(404).json({ active: false, participants: 0 });
+    }
+
+    const participants =
+      session.participants && typeof session.participants.size === "number"
+        ? session.participants.size
+        : 0;
+
+    return res.json({
+      active: !!session.active,
+      participants,
+    });
+  } catch (err) {
+    console.error("Error in /sessions/status:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // ---------- Message routes ----------
 
 // Get all messages for a session
