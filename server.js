@@ -28,7 +28,7 @@ app.get("/", (req, res) => {
 const sessions = {};
 
 // If one device hasn't checked in for this long, we treat the session as ended (ms)
-const OFFLINE_TIMEOUT_MS = 10000; // 10 seconds
+const OFFLINE_TIMEOUT_MS = 20000; // 20 seconds
 
 // Simple in-memory metrics (reset when server restarts)
 const metrics = {
