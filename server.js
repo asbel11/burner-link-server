@@ -27,6 +27,9 @@ app.get("/", (req, res) => {
 // }
 const sessions = {};
 
+// If one device hasn't checked in for this long, we treat the session as ended (ms)
+const OFFLINE_TIMEOUT_MS = 10000; // 10 seconds
+
 // Simple in-memory metrics (reset when server restarts)
 const metrics = {
   cameraClicks: 0,
@@ -67,6 +70,7 @@ app.post("/sessions/create", (req, res) => {
     messages: [],
     // creator is first participant
     participants: new Set([deviceId]),
+    lastSeen: { [deviceId]: Date.now() },
   };
 
   console.log("Created session", sessionId, "for code", code, "by", deviceId);
@@ -105,6 +109,10 @@ app.post("/sessions/join", (req, res) => {
         .json({ error: "Session already has two devices connected." });
     }
     session.participants.add(deviceId);
+    if (!session.lastSeen) {
+      session.lastSeen = {};
+    }
+    session.lastSeen[deviceId] = Date.now();
   }
 
   console.log("Joined session", sessionId, "with code", code, "by", deviceId);
@@ -151,6 +159,56 @@ app.get("/sessions/status/:sessionId", (req, res) => {
     });
   } catch (err) {
     console.error("Error in /sessions/status:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Heartbeat route so each device can signal it is still connected. If the other
+// device has not checked in for OFFLINE_TIMEOUT_MS, we mark the session as ended.
+app.post("/sessions/heartbeat", (req, res) => {
+  try {
+    const { sessionId, deviceId } = req.body || {};
+    if (!sessionId || typeof sessionId !== "string") {
+      return res.status(400).json({ error: "Missing or invalid sessionId" });
+    }
+    if (!deviceId || typeof deviceId !== "string") {
+      return res.status(400).json({ error: "Missing or invalid deviceId" });
+    }
+
+    const session = sessions[sessionId];
+    if (!session || !session.active) {
+      return res.status(404).json({ error: "Session not found or inactive" });
+    }
+
+    if (!session.participants) {
+      session.participants = new Set();
+    }
+    session.participants.add(deviceId);
+
+    if (!session.lastSeen) {
+      session.lastSeen = {};
+    }
+    const now = Date.now();
+    session.lastSeen[deviceId] = now;
+
+    // If there are at least two participants, check whether the other one
+    // has gone offline for too long. If so, end the session.
+    const entries = Object.entries(session.lastSeen);
+    if (entries.length >= 2) {
+      const stale = entries.find(
+        ([id, ts]) => id !== deviceId && now - ts > OFFLINE_TIMEOUT_MS
+      );
+      if (stale) {
+        session.active = false;
+        session.messages = [];
+        session.participants = new Set();
+        return res.json({ ok: true, ended: true });
+      }
+    }
+
+    return res.json({ ok: true, ended: false });
+  } catch (err) {
+    console.error("Error in /sessions/heartbeat:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
