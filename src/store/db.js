@@ -3,14 +3,40 @@ const path = require("path");
 const Database = require("better-sqlite3");
 
 /**
+ * Resolve SQLite file path for local + Railway (and tests via explicitPath).
+ * Priority: explicitPath (tests) → DATABASE_PATH → data/burner-link.db under cwd.
+ * Relative env paths are resolved against process.cwd(); absolute paths are normalized only.
+ *
+ * @param {string|undefined} [explicitPath]
+ * @returns {string}
+ */
+function resolveDatabaseFilePath(explicitPath) {
+  if (explicitPath != null && String(explicitPath).trim() !== "") {
+    const raw = String(explicitPath).trim();
+    return path.isAbsolute(raw)
+      ? path.normalize(raw)
+      : path.resolve(process.cwd(), raw);
+  }
+  const env = process.env.DATABASE_PATH;
+  if (env != null && String(env).trim() !== "") {
+    const raw = String(env).trim();
+    return path.isAbsolute(raw)
+      ? path.normalize(raw)
+      : path.resolve(process.cwd(), raw);
+  }
+  return path.resolve(process.cwd(), "data", "burner-link.db");
+}
+
+/**
  * Opens SQLite and applies the CONNECT-oriented room schema.
  * `rooms.id` is the only chat id — same as V1 `sessionId` and V2 `roomId` (see docs/v1-v2-id-contract.md).
  */
 function openDatabase(dbFilePath) {
-  const dir = path.dirname(dbFilePath);
+  const resolvedPath = path.resolve(dbFilePath);
+  const dir = path.dirname(resolvedPath);
   fs.mkdirSync(dir, { recursive: true });
 
-  const db = new Database(dbFilePath);
+  const db = new Database(resolvedPath);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
 
@@ -147,4 +173,4 @@ function migrateRetentionPurchasesIdempotency(db) {
   `);
 }
 
-module.exports = { openDatabase };
+module.exports = { openDatabase, resolveDatabaseFilePath };
