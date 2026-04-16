@@ -4,29 +4,78 @@ const Database = require("better-sqlite3");
 
 const LOG_PREFIX = "[burner-link db]";
 
+const DEFAULT_DB_FILENAME = "burner-link.db";
+
+/**
+ * Turn a path (env or explicit) into a concrete SQLite **file** path.
+ * - If it points to an **existing directory** → `{dir}/burner-link.db`
+ * - If it points to an **existing file** → use as-is
+ * - If it does not exist yet: trailing slash → directory; basename ends with `.db` / `.sqlite` → file; basename has no `.` → directory; otherwise treat as a file path
+ *
+ * @param {string} rawInput
+ * @param {string} cwd
+ * @returns {string}
+ */
+function resolveDatabaseFileFromInput(rawInput, cwd) {
+  const trimmed = String(rawInput).trim();
+  if (trimmed === "") {
+    return path.resolve(cwd, "data", DEFAULT_DB_FILENAME);
+  }
+
+  const resolved = path.isAbsolute(trimmed)
+    ? path.normalize(trimmed)
+    : path.resolve(cwd, trimmed);
+
+  let st = null;
+  try {
+    if (fs.existsSync(resolved)) {
+      st = fs.statSync(resolved);
+    }
+  } catch {
+    st = null;
+  }
+
+  if (st && st.isDirectory()) {
+    return path.join(resolved, DEFAULT_DB_FILENAME);
+  }
+  if (st && st.isFile()) {
+    return resolved;
+  }
+
+  if (/[/\\]$/.test(trimmed)) {
+    const dirOnly = resolved.replace(/[/\\]+$/, "");
+    return path.join(dirOnly, DEFAULT_DB_FILENAME);
+  }
+
+  const base = path.basename(resolved);
+  if (/\.db$/i.test(base) || /\.sqlite3?$/i.test(base)) {
+    return resolved;
+  }
+
+  if (!base.includes(".")) {
+    return path.join(resolved, DEFAULT_DB_FILENAME);
+  }
+
+  return resolved;
+}
+
 /**
  * Resolve SQLite file path for local + Railway (and tests via explicitPath).
  * Priority: explicitPath (tests) → DATABASE_PATH → data/burner-link.db under cwd.
- * Relative env paths are resolved against process.cwd(); absolute paths are normalized only.
  *
  * @param {string|undefined} [explicitPath]
  * @returns {string}
  */
 function resolveDatabaseFilePath(explicitPath) {
+  const cwd = process.cwd();
   if (explicitPath != null && String(explicitPath).trim() !== "") {
-    const raw = String(explicitPath).trim();
-    return path.isAbsolute(raw)
-      ? path.normalize(raw)
-      : path.resolve(process.cwd(), raw);
+    return resolveDatabaseFileFromInput(String(explicitPath), cwd);
   }
   const env = process.env.DATABASE_PATH;
   if (env != null && String(env).trim() !== "") {
-    const raw = String(env).trim();
-    return path.isAbsolute(raw)
-      ? path.normalize(raw)
-      : path.resolve(process.cwd(), raw);
+    return resolveDatabaseFileFromInput(String(env), cwd);
   }
-  return path.resolve(process.cwd(), "data", "burner-link.db");
+  return path.resolve(cwd, "data", DEFAULT_DB_FILENAME);
 }
 
 /**
@@ -252,4 +301,8 @@ function migrateRetentionPurchasesIdempotency(db) {
   `);
 }
 
-module.exports = { openDatabase, resolveDatabaseFilePath };
+module.exports = {
+  openDatabase,
+  resolveDatabaseFilePath,
+  resolveDatabaseFileFromInput,
+};
