@@ -1,5 +1,7 @@
 # Stripe Checkout — retention purchases (Phase 22)
 
+For **CONNECT Pro** subscription checkout (**`POST /v2/billing/create-membership-checkout-session`**) and membership webhooks/status, see **`docs/v2-connect-membership.md`**.
+
 ## Route
 
 **`POST /v2/rooms/:roomId/billing/create-checkout-session`**

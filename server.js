@@ -12,6 +12,8 @@ const { isManualRetentionPostAllowed } = require("./src/retentionManualPolicy");
 const { handleStripeWebhookPost } = require("./src/stripeWebhook");
 const { getStripeApiClient } = require("./src/stripeClient");
 const { createRetentionCheckoutSession } = require("./src/stripeCheckout");
+const { createMembershipCheckoutSession } = require("./src/stripeMembershipCheckout");
+const { createConnectProPortalSession } = require("./src/stripeCustomerPortal");
 const { getCheckoutSessionSyncStatus } = require("./src/stripeCheckoutStatus");
 
 function envFlag(name, defaultValue = false) {
@@ -31,7 +33,7 @@ app.post(
   "/v2/webhooks/stripe",
   express.raw({ type: "application/json" }),
   (req, res) => {
-    handleStripeWebhookPost(req, res, store.rooms).catch((err) => {
+    handleStripeWebhookPost(req, res, store.rooms, store.membership).catch((err) => {
       console.error("Error in POST /v2/webhooks/stripe:", err);
       if (!res.headersSent) {
         res.status(500).json({ error: "Internal server error" });
@@ -519,6 +521,138 @@ app.post("/v2/rooms/:roomId/rotate-invite-code", (req, res) => {
     });
   } catch (err) {
     console.error("Error in POST /v2/rooms/:roomId/rotate-invite-code:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ---------- V2 membership checkout (Stripe subscription — Phase M2) ----------
+
+app.post("/v2/billing/create-membership-checkout-session", async (req, res) => {
+  try {
+    const { deviceId, successUrl, cancelUrl } = req.body || {};
+    if (!isValidDeviceId(deviceId)) {
+      return res.status(400).json({ error: "Missing or invalid deviceId" });
+    }
+
+    const stripe = getStripeApiClient();
+    if (!stripe) {
+      return res.status(503).json({
+        error: "Stripe API is not configured (set STRIPE_SECRET_KEY)",
+        reason: "stripe_not_configured",
+      });
+    }
+
+    const out = await createMembershipCheckoutSession(stripe, {
+      deviceId: deviceId.trim(),
+      successUrl,
+      cancelUrl,
+    });
+
+    if (!out.ok) {
+      if (out.reason === "price_not_configured") {
+        return res.status(503).json({
+          error: `No Stripe Price ID configured for membership (set ${out.envKey})`,
+          reason: "price_not_configured",
+          envKey: out.envKey,
+        });
+      }
+      if (out.reason === "missing_checkout_urls") {
+        return res.status(400).json({
+          error:
+            "Provide successUrl and cancelUrl in the JSON body, or set STRIPE_CHECKOUT_SUCCESS_URL and STRIPE_CHECKOUT_CANCEL_URL",
+          reason: "missing_checkout_urls",
+        });
+      }
+      if (out.reason === "invalid_device_id") {
+        return res.status(400).json({ error: "Missing or invalid deviceId" });
+      }
+      return res.status(out.httpStatus || 400).json({
+        error: "Membership checkout session could not be created",
+        reason: out.reason,
+      });
+    }
+
+    const { ok: _ok, ...body } = out;
+    return res.status(200).json(body);
+  } catch (err) {
+    console.error("Error in POST /v2/billing/create-membership-checkout-session:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// CONNECT Pro — Stripe Customer Portal (manage/cancel; Phase M3b)
+app.post("/v2/billing/create-portal-session", async (req, res) => {
+  try {
+    const { deviceId } = req.body || {};
+    if (!isValidDeviceId(deviceId)) {
+      return res.status(400).json({ error: "Missing or invalid deviceId" });
+    }
+
+    const stripe = getStripeApiClient();
+    if (!stripe) {
+      return res.status(503).json({
+        error: "Stripe API is not configured (set STRIPE_SECRET_KEY)",
+        reason: "stripe_not_configured",
+      });
+    }
+
+    const out = await createConnectProPortalSession(
+      stripe,
+      store.membership,
+      deviceId.trim(),
+      req.body || {}
+    );
+
+    if (!out.ok) {
+      const map = {
+        invalid_device_id: 400,
+        membership_not_found: 404,
+        stripe_customer_not_linked: 404,
+        missing_return_url: 400,
+        invalid_return_url: 400,
+        portal_session_incomplete: 502,
+        stripe_portal_error: 502,
+      };
+      const status = map[out.reason] || out.httpStatus || 400;
+      const payload = {
+        error:
+          out.reason === "membership_not_found"
+            ? "No membership record for this device"
+            : out.reason === "stripe_customer_not_linked"
+              ? "No Stripe customer linked to this device; complete membership checkout first"
+              : out.reason === "missing_return_url" || out.reason === "invalid_return_url"
+                ? "Invalid or missing return URL for Customer Portal"
+                : out.reason === "stripe_portal_error"
+                  ? "Could not create Stripe Customer Portal session"
+                  : "Could not create portal session",
+        reason: out.reason,
+      };
+      if (out.hint) payload.hint = out.hint;
+      if (out.detail) payload.detail = out.detail;
+      return res.status(status).json(payload);
+    }
+
+    return res.status(200).json({ url: out.url });
+  } catch (err) {
+    console.error("Error in POST /v2/billing/create-portal-session:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// CONNECT Pro membership status (read-only; deviceId-only identity — Phase M3a)
+app.get("/v2/billing/membership", (req, res) => {
+  try {
+    const deviceId = req.query.deviceId;
+    if (!isValidDeviceId(deviceId)) {
+      return res.status(400).json({ error: "Missing or invalid deviceId" });
+    }
+    const body = store.membership.getMembershipStatus(deviceId.trim());
+    if (body == null) {
+      return res.status(400).json({ error: "Missing or invalid deviceId" });
+    }
+    return res.status(200).json(body);
+  } catch (err) {
+    console.error("Error in GET /v2/billing/membership:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 });

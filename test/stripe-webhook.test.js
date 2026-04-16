@@ -6,6 +6,7 @@ const os = require("os");
 const Stripe = require("stripe");
 const { openDatabase } = require("../src/store/db");
 const { createRoomRepository } = require("../src/store/roomRepository");
+const { createDeviceMembershipStore } = require("../src/deviceMembership");
 const {
   handleStripeWebhookPost,
   mapStripeEventToEntitlementInput,
@@ -55,23 +56,36 @@ describe("mapStripeEventToEntitlementInput", () => {
     assert.equal(m.kind, "ignore");
   });
 
-  test("checkout.session.completed missing metadata → reject", async () => {
+  test("checkout.session.completed payment mode missing metadata → reject", async () => {
     const m = await mapStripeEventToEntitlementInput({
       id: "evt_1",
       type: "checkout.session.completed",
       created: 1,
       data: {
-        object: { id: "cs_1", metadata: {} },
+        object: { id: "cs_1", mode: "payment", metadata: {} },
       },
     });
     assert.equal(m.kind, "reject");
     assert.equal(m.reason, "missing_stripe_metadata");
+  });
+
+  test("checkout.session.completed subscription without retention metadata → ignore", async () => {
+    const m = await mapStripeEventToEntitlementInput({
+      id: "evt_1",
+      type: "checkout.session.completed",
+      created: 1,
+      data: {
+        object: { id: "cs_1", mode: "subscription", metadata: {} },
+      },
+    });
+    assert.equal(m.kind, "ignore");
   });
 });
 
 describe("handleStripeWebhookPost", () => {
   let dbPath;
   let rooms;
+  let membership;
   let prevWh;
   let prevSk;
 
@@ -86,7 +100,8 @@ describe("handleStripeWebhookPost", () => {
       `burner-stripe-${Date.now()}-${Math.random().toString(16).slice(2)}.db`
     );
     const db = openDatabase(dbPath);
-    rooms = createRoomRepository(db);
+    membership = createDeviceMembershipStore(db);
+    rooms = createRoomRepository(db, { membership });
     rooms.createRoomFromV1({
       id: "room-stripe",
       inviteCode: "555555",
@@ -124,6 +139,7 @@ describe("handleStripeWebhookPost", () => {
         object: {
           id: "cs_test",
           object: "checkout.session",
+          mode: "payment",
           metadata: metadata || {},
         },
       },
@@ -142,7 +158,7 @@ describe("handleStripeWebhookPost", () => {
       headers: { "stripe-signature": "t=1,v1=deadbeef" },
     };
     const res = mockRes();
-    await handleStripeWebhookPost(req, res, rooms);
+    await handleStripeWebhookPost(req, res, rooms, membership);
     assert.equal(res._o.statusCode, 400);
     assert.equal(res._o.body.reason, "invalid_signature");
   });
@@ -156,7 +172,7 @@ describe("handleStripeWebhookPost", () => {
     const { rawBody, header } = signStripeEvent(ev);
     const req = { body: rawBody, headers: { "stripe-signature": header } };
     const res = mockRes();
-    await handleStripeWebhookPost(req, res, rooms);
+    await handleStripeWebhookPost(req, res, rooms, membership);
     assert.equal(res._o.statusCode, 200);
     assert.equal(res._o.body.retentionTier, "30_days");
     assert.equal(res._o.body.retentionSource, "stripe");
@@ -172,13 +188,14 @@ describe("handleStripeWebhookPost", () => {
     const { rawBody, header } = signStripeEvent(ev);
     const req = { body: rawBody, headers: { "stripe-signature": header } };
     const res1 = mockRes();
-    await handleStripeWebhookPost(req, res1, rooms);
+    await handleStripeWebhookPost(req, res1, rooms, membership);
     assert.equal(res1._o.body.duplicate, false);
     const res2 = mockRes();
     await handleStripeWebhookPost(
       { body: rawBody, headers: { "stripe-signature": header } },
       res2,
-      rooms
+      rooms,
+      membership
     );
     assert.equal(res2._o.statusCode, 200);
     assert.equal(res2._o.body.duplicate, true);
@@ -195,7 +212,8 @@ describe("handleStripeWebhookPost", () => {
     await handleStripeWebhookPost(
       { body: rawBody, headers: { "stripe-signature": header } },
       res,
-      rooms
+      rooms,
+      membership
     );
     assert.equal(res._o.statusCode, 400);
     assert.equal(res._o.body.reason, "invalid_retention_tier");
@@ -214,7 +232,8 @@ describe("handleStripeWebhookPost", () => {
     await handleStripeWebhookPost(
       { body: rawBody, headers: { "stripe-signature": header } },
       res,
-      rooms
+      rooms,
+      membership
     );
     assert.equal(res._o.statusCode, 200);
     assert.equal(res._o.body.ignored, true);
@@ -244,7 +263,8 @@ describe("handleStripeWebhookPost", () => {
       await handleStripeWebhookPost(
         { body: rawBody, headers: { "stripe-signature": header } },
         res,
-        rooms
+        rooms,
+        membership
       );
       assert.equal(res._o.statusCode, 400);
       assert.equal(res._o.body.reason, "missing_stripe_metadata");
@@ -279,7 +299,8 @@ describe("handleStripeWebhookPost", () => {
     await handleStripeWebhookPost(
       { body: rawBody, headers: { "stripe-signature": header } },
       res,
-      rooms
+      rooms,
+      membership
     );
     assert.equal(res._o.statusCode, 200);
     assert.equal(res._o.body.retentionTier, "30_days");

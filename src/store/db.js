@@ -234,6 +234,7 @@ function openDatabase(dbFilePath) {
 
   migrateRoomsRetention(db);
   migrateRetentionPurchasesIdempotency(db);
+  migrateDeviceMembership(db);
 
   // Best-effort backfill for DBs created before device_room_links existed.
   db.exec(`
@@ -298,6 +299,30 @@ function migrateRetentionPurchasesIdempotency(db) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_retention_purchases_idempotent
       ON retention_purchases (idempotency_provider, idempotency_key)
       WHERE idempotency_key IS NOT NULL
+  `);
+}
+
+/**
+ * Phase M2 — CONNECT membership (Stripe subscription) keyed by device_id; billing identity stays server-side.
+ */
+function migrateDeviceMembership(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS device_memberships (
+      device_id TEXT PRIMARY KEY,
+      membership_tier TEXT NOT NULL DEFAULT 'pro',
+      membership_active_until INTEGER,
+      stripe_customer_id TEXT,
+      stripe_subscription_id TEXT,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_device_memberships_subscription
+      ON device_memberships (stripe_subscription_id);
+    CREATE TABLE IF NOT EXISTS membership_stripe_events (
+      event_id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
   `);
 }
 

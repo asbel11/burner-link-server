@@ -9,6 +9,7 @@ const {
   respondWithEntitlementResult,
 } = require("./billingIngestion");
 const { getStripeApiClient, API_VERSION } = require("./stripeClient");
+const { processMembershipStripeEvent } = require("./stripeMembershipWebhook");
 
 /** Stripe client for webhook verification only (API key unused for constructEvent). */
 function stripeForWebhooks() {
@@ -93,8 +94,12 @@ async function mapStripeEventToEntitlementInput(event) {
 
   if (event.type === "checkout.session.completed") {
     const session = event.data && event.data.object;
+    const mode = session && session.mode;
     const meta = extractRetentionMetadata(session && session.metadata);
     if (!meta.ok) {
+      if (mode === "subscription") {
+        return { kind: "ignore" };
+      }
       return {
         kind: "reject",
         status: 400,
@@ -165,8 +170,9 @@ async function mapStripeEventToEntitlementInput(event) {
  * @param {import("express").Request} req
  * @param {import("express").Response} res
  * @param {{ applyBillingRetentionEntitlement: Function }} rooms
+ * @param {object} membership device membership store (see src/deviceMembership.js)
  */
-async function handleStripeWebhookPost(req, res, rooms) {
+async function handleStripeWebhookPost(req, res, rooms, membership) {
   const secret = process.env.STRIPE_WEBHOOK_SECRET;
   if (secret == null || String(secret).trim() === "") {
     return res.status(503).json({
@@ -200,6 +206,16 @@ async function handleStripeWebhookPost(req, res, rooms) {
       error: "Invalid Stripe webhook signature",
       reason: "invalid_signature",
     });
+  }
+
+  const membershipOutcome = await processMembershipStripeEvent(event, {
+    membership,
+    stripe: stripeForApi(),
+  });
+  if (membershipOutcome.handled) {
+    return res
+      .status(membershipOutcome.httpStatus || 200)
+      .json(membershipOutcome.body);
   }
 
   const mapped = await mapStripeEventToEntitlementInput(event);

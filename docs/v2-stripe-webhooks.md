@@ -26,6 +26,10 @@ Invalid or missing signature → **`400`**, **`reason: invalid_signature`** or *
 | **`invoice.paid`** | Grants/extends from **`invoice.metadata`**, or from **subscription metadata** if **`STRIPE_SECRET_KEY`** is set and metadata was copied onto the Subscription. |
 | **All other types** | **`200`** `{ received: true, ignored: true, type }` — no entitlement change. |
 
+### CONNECT Pro membership (subscription)
+
+If the session or subscription carries **`connectBilling=membership`** metadata, the server applies **device-level membership** first (see **`docs/v2-connect-membership.md`**) before the retention rules above. Retention-only Checkout remains **`mode: payment`**; membership Checkout uses **`mode: subscription`**.
+
 ## Required metadata (string keys)
 
 Stripe metadata values are **strings**. The server expects:

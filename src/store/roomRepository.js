@@ -9,7 +9,9 @@ const crypto = require("crypto");
 const {
   buildRetentionView,
   normalizeRetentionSource,
+  computeCanExtendRetention,
 } = require("../retentionContract");
+const { getConnectMemberIncludedRetentionTier } = require("../connectMemberRetention");
 
 const MAX_V1_DEVICES_PER_ROOM = 2;
 const INVITE_ROTATE_MAX_ATTEMPTS = 25;
@@ -126,7 +128,51 @@ function retentionView(room) {
   return buildRetentionView(room, { toIso });
 }
 
-function createRoomRepository(db) {
+/**
+ * @param {import("better-sqlite3").Database} db
+ * @param {{ membership?: object|null }} [opts]
+ */
+function createRoomRepository(db, opts = {}) {
+  const membership = opts.membership || null;
+
+  /**
+   * Effective retention for API responses: CONNECT membership includes a minimum paid tier without coins.
+   * @param {object} room rooms row or list row shape with retention_* fields
+   * @param {string} deviceId
+   */
+  function retentionViewForDevice(room, deviceId) {
+    const base = retentionView(room);
+    const dev = typeof deviceId === "string" ? deviceId.trim() : "";
+    if (!membership || !dev || !membership.isDeviceMember(dev)) {
+      return base;
+    }
+
+    const inc = getConnectMemberIncludedRetentionTier();
+    if (!ALLOWED_RETENTION_TIERS.has(inc)) {
+      return { ...base, connectMembershipActive: true };
+    }
+
+    const curTier = room.retention_tier || "default";
+    if (tierRank(inc) <= tierRank(curTier)) {
+      return { ...base, connectMembershipActive: true };
+    }
+
+    const now = nowMs();
+    const until = retentionUntilForTier(inc, now);
+    return {
+      ...base,
+      retentionTier: inc,
+      retentionUntil: toIso(until),
+      retentionSource: normalizeRetentionSource("connect_membership"),
+      isPaidRetention: inc !== "default",
+      canExtendRetention: computeCanExtendRetention({
+        ...room,
+        retention_tier: inc,
+      }),
+      connectMembershipActive: true,
+    };
+  }
+
   const stmtRoomById = db.prepare(
     `SELECT id, invite_code, state, created_at, updated_at, ended_at, deleted_at,
             last_message_at, schema_version, retention_tier, retention_until, retention_source
@@ -575,7 +621,7 @@ function createRoomRepository(db) {
     }
     return {
       ok: true,
-      ...retentionView(room),
+      ...retentionViewForDevice(room, deviceId),
     };
   }
 
@@ -690,7 +736,7 @@ function createRoomRepository(db) {
       return {
         ok: true,
         duplicate: true,
-        ...retentionView(room),
+        ...retentionViewForDevice(room, deviceId),
       };
     }
 
@@ -767,7 +813,7 @@ function createRoomRepository(db) {
           return {
             ok: true,
             duplicate: true,
-            ...retentionView(r),
+            ...retentionViewForDevice(r, deviceId),
           };
         }
       }
@@ -778,7 +824,7 @@ function createRoomRepository(db) {
     return {
       ok: true,
       duplicate: false,
-      ...retentionView(refreshed),
+      ...retentionViewForDevice(refreshed, deviceId),
     };
   }
 
@@ -819,7 +865,7 @@ function createRoomRepository(db) {
         lastMessageAt: toIso(row.last_message_at),
         memberCount: row.member_count,
         messageCount: row.message_count,
-        ...retentionView(roomMini),
+        ...retentionViewForDevice(roomMini, p.deviceId),
         ...bridge,
       };
     });
@@ -871,7 +917,7 @@ function createRoomRepository(db) {
         memberCount,
         messageCount,
         linkedAt: linkRow ? toIso(linkRow.linked_at) : null,
-        ...retentionView(room),
+        ...retentionViewForDevice(room, deviceId),
         ...bridge,
       },
     };

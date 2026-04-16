@@ -11,6 +11,7 @@ const KNOWN_SOURCES = new Set([
   "server_default",
   "manual",
   "stripe",
+  "connect_membership",
   "revenuecat",
   "app_store",
   "google_play",
