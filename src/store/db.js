@@ -2,6 +2,8 @@ const fs = require("fs");
 const path = require("path");
 const Database = require("better-sqlite3");
 
+const LOG_PREFIX = "[burner-link db]";
+
 /**
  * Resolve SQLite file path for local + Railway (and tests via explicitPath).
  * Priority: explicitPath (tests) → DATABASE_PATH → data/burner-link.db under cwd.
@@ -28,16 +30,93 @@ function resolveDatabaseFilePath(explicitPath) {
 }
 
 /**
+ * @param {string} absDir normalized absolute directory
+ */
+function isUnderDataMount(absDir) {
+  const n = path.normalize(absDir);
+  return n === "/data" || n.startsWith("/data/");
+}
+
+/**
+ * @param {string} dir absolute directory path
+ */
+function assertDirectoryWritable(dir) {
+  const testFile = path.join(
+    dir,
+    `.burner-link-write-test-${process.pid}-${Date.now()}`
+  );
+  try {
+    fs.writeFileSync(testFile, "ok");
+    fs.unlinkSync(testFile);
+  } catch (err) {
+    const railwayHint = isUnderDataMount(dir)
+      ? " On Railway, attach a persistent volume mounted at /data (or choose a path under the app directory that is writable)."
+      : " Ensure the process user can create files in this directory.";
+    const msg = `${LOG_PREFIX} Directory is not writable: ${dir}.${railwayHint} (${err.code || err.name}: ${err.message})`;
+    throw new Error(msg);
+  }
+}
+
+/**
  * Opens SQLite and applies the CONNECT-oriented room schema.
  * `rooms.id` is the only chat id — same as V1 `sessionId` and V2 `roomId` (see docs/v1-v2-id-contract.md).
  */
 function openDatabase(dbFilePath) {
   const resolvedPath = path.resolve(dbFilePath);
-  const dir = path.dirname(resolvedPath);
-  fs.mkdirSync(dir, { recursive: true });
+  const parentDir = path.dirname(resolvedPath);
 
-  const db = new Database(resolvedPath);
-  db.pragma("journal_mode = WAL");
+  const existsBeforeMkdir = fs.existsSync(parentDir);
+  console.error(
+    `${LOG_PREFIX} startup: cwd=${JSON.stringify(process.cwd())} DATABASE_PATH=${JSON.stringify(process.env.DATABASE_PATH ?? "")} resolvedFile=${JSON.stringify(resolvedPath)} parentDir=${JSON.stringify(parentDir)} existsSync(parentDir)_before_mkdir=${existsBeforeMkdir}`
+  );
+
+  try {
+    fs.mkdirSync(parentDir, { recursive: true });
+  } catch (err) {
+    const railwayHint = isUnderDataMount(parentDir)
+      ? " On Railway, add a volume mounted at /data (Dashboard → your service → Volumes) and set DATABASE_PATH=/data/burner-link.db, or use a path your user can create (e.g. under the app root)."
+      : "";
+    throw new Error(
+      `${LOG_PREFIX} Could not create database directory ${JSON.stringify(parentDir)}:${railwayHint} (${err.code || err.name}: ${err.message})`
+    );
+  }
+
+  const existsAfterMkdir = fs.existsSync(parentDir);
+  console.error(
+    `${LOG_PREFIX} after mkdirSync: existsSync(parentDir)=${existsAfterMkdir}`
+  );
+
+  try {
+    assertDirectoryWritable(parentDir);
+  } catch (err) {
+    if (isUnderDataMount(parentDir)) {
+      console.error(
+        `${LOG_PREFIX} If using /data without a volume, the default Linux filesystem may not allow writing there. Mount a Railway volume at /data or set DATABASE_PATH to a writable path.`
+      );
+    }
+    throw err;
+  }
+
+  let db;
+  try {
+    db = new Database(resolvedPath);
+  } catch (err) {
+    const railwayHint = isUnderDataMount(parentDir)
+      ? " Often caused by a missing or read-only /data volume on Railway. Mount a volume at /data or use e.g. DATABASE_PATH relative to the app."
+      : "";
+    throw new Error(
+      `${LOG_PREFIX} SQLite failed to open ${JSON.stringify(resolvedPath)}:${railwayHint} (${err.code || err.name}: ${err.message})`
+    );
+  }
+
+  try {
+    db.pragma("journal_mode = WAL");
+  } catch (err) {
+    db.close();
+    throw new Error(
+      `${LOG_PREFIX} WAL mode failed (directory must be writable for -wal/-shm files): ${err.message}`
+    );
+  }
   db.pragma("foreign_keys = ON");
 
   db.exec(`
