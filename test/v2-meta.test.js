@@ -53,6 +53,7 @@ describe("GET /v2/meta (deploy probe)", () => {
           assert.ok(json.version);
           assert.equal(json.connect.postGroupRoomCreate.path, "/v2/rooms/create");
           assert.equal(json.connect.postGroupRoomCreate.available, true);
+          assert.equal(typeof json.connect.attachmentStorage?.configured, "boolean");
         } catch (e) {
           err = e;
         } finally {

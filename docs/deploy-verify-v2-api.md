@@ -44,10 +44,15 @@ GET /v2/meta
       "method": "POST",
       "path": "/v2/rooms/create",
       "available": true
+    },
+    "attachmentStorage": {
+      "configured": true
     }
   }
 }
 ```
+
+**`attachmentStorage.configured`** — **`true`** when S3 env is complete and **`store.attachmentStorage`** is non-null at startup. See **`docs/attachment-storage-ops-railway.md`** (Attachment-Storage-Ops-2).
 
 - If **`GET /v2/meta`** returns **404**, the deployment does **not** include this server version (or the request URL is wrong).
 - If **`GET /v2/meta`** returns **200** but **`POST /v2/rooms/create`** returns **404**, report that as abnormal (should not happen on the same base URL for a single Express app).

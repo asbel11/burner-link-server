@@ -22,6 +22,8 @@ See **`docs/connect-media-messages.md`**.
 
 Required for **`POST /v2/rooms/:roomId/attachments/prepare`** and related routes. Full contract: **`docs/connect-attachments-storage.md`**.
 
+**Railway / production checklist and 503 troubleshooting:** **`docs/attachment-storage-ops-railway.md`**.
+
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | **`CONNECT_S3_BUCKET`** (or **`S3_BUCKET`**) | **Yes** (for attachments) | Bucket name. |

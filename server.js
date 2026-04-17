@@ -50,6 +50,9 @@ app.use(cors());
 
 const store = createRoomStore();
 console.log("Room store (SQLite):", store.dbFilePath);
+console.log(
+  `[connect] attachmentStorage at startup: ${store.attachmentStorage ? "configured (S3 client ready)" : "null — POST .../attachments/prepare returns 503 storage_not_configured; set CONNECT_S3_BUCKET + CONNECT_S3_ACCESS_KEY_ID + CONNECT_S3_SECRET_ACCESS_KEY"}`
+);
 
 // Stripe verifies HMAC over the raw JSON bytes — register before express.json().
 app.post(
@@ -526,6 +529,10 @@ app.get("/v2/meta", (req, res) => {
           method: "POST",
           path: "/v2/rooms/create",
           available: true,
+        },
+        /** True when `createS3ClientFromEnv()` succeeded — same as non-null `store.attachmentStorage`. */
+        attachmentStorage: {
+          configured: store.attachmentStorage != null,
         },
       },
     });
