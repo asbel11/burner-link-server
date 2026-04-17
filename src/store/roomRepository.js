@@ -16,6 +16,14 @@ const { getConnectMemberIncludedRetentionTier } = require("../connectMemberReten
 const MAX_V1_DEVICES_PER_ROOM = 2;
 const INVITE_ROTATE_MAX_ATTEMPTS = 25;
 
+/** Default window for pending save requests (overridable via MUTUAL_SAVE_PENDING_MS). */
+const SAVE_PENDING_MS_DEFAULT = 7 * 24 * 60 * 60 * 1000;
+
+function savePendingDurationMs() {
+  const n = Number(process.env.MUTUAL_SAVE_PENDING_MS);
+  return Number.isFinite(n) && n > 0 ? n : SAVE_PENDING_MS_DEFAULT;
+}
+
 function nowMs() {
   return Date.now();
 }
@@ -175,8 +183,38 @@ function createRoomRepository(db, opts = {}) {
 
   const stmtRoomById = db.prepare(
     `SELECT id, invite_code, state, created_at, updated_at, ended_at, deleted_at,
-            last_message_at, schema_version, retention_tier, retention_until, retention_source
+            last_message_at, schema_version, retention_tier, retention_until, retention_source,
+            save_state, save_requested_by_device_id, save_requested_at, save_responded_at,
+            save_pending_expires_at
      FROM rooms WHERE id = ?`
+  );
+
+  /**
+   * If a pending save request passed its expiry, clear back to none (no session end).
+   */
+  const expireStalePendingSave = db.prepare(
+    `UPDATE rooms SET
+        save_state = 'none',
+        save_requested_by_device_id = NULL,
+        save_requested_at = NULL,
+        save_pending_expires_at = NULL,
+        updated_at = @updated_at
+     WHERE id = @id AND save_state = 'pending'
+       AND save_pending_expires_at IS NOT NULL
+       AND save_pending_expires_at < @now`
+  );
+
+  /** Clears expired pending rows in one pass (list/detail reads). */
+  const expireAllStalePendingSaves = db.prepare(
+    `UPDATE rooms SET
+        save_state = 'none',
+        save_requested_by_device_id = NULL,
+        save_requested_at = NULL,
+        save_pending_expires_at = NULL,
+        updated_at = @updated_at
+     WHERE save_state = 'pending'
+       AND save_pending_expires_at IS NOT NULL
+       AND save_pending_expires_at < @now`
   );
 
   const stmtActiveRoomIdByCode = db.prepare(
@@ -209,10 +247,24 @@ function createRoomRepository(db, opts = {}) {
   );
 
   const upsertMember = db.prepare(
-    `INSERT INTO room_members (room_id, device_id, joined_at, last_seen_at)
-     VALUES (@room_id, @device_id, @joined_at, @last_seen_at)
+    `INSERT INTO room_members (room_id, device_id, joined_at, last_seen_at, last_live_chat_left_at)
+     VALUES (@room_id, @device_id, @joined_at, @last_seen_at, NULL)
      ON CONFLICT(room_id, device_id) DO UPDATE SET
-       last_seen_at = excluded.last_seen_at`
+       last_seen_at = excluded.last_seen_at,
+       last_live_chat_left_at = NULL`
+  );
+
+  const updateMemberLiveChatLeave = db.prepare(
+    `UPDATE room_members SET last_live_chat_left_at = @t WHERE room_id = @room_id AND device_id = @device_id`
+  );
+
+  const insertMemberMinimal = db.prepare(
+    `INSERT INTO room_members (room_id, device_id, joined_at, last_seen_at, last_live_chat_left_at)
+     VALUES (@room_id, @device_id, @joined_at, @last_seen_at, @left_at)`
+  );
+
+  const clearMemberLiveChatLeave = db.prepare(
+    `UPDATE room_members SET last_live_chat_left_at = NULL WHERE room_id = ? AND device_id = ?`
   );
 
   const countDistinctMembers = db.prepare(
@@ -233,7 +285,12 @@ function createRoomRepository(db, opts = {}) {
 
   const updateRoomEnded = db.prepare(
     `UPDATE rooms SET state = 'ended', ended_at = @ended_at, updated_at = @updated_at,
-            last_message_at = NULL
+            last_message_at = NULL,
+            save_state = 'none',
+            save_requested_by_device_id = NULL,
+            save_requested_at = NULL,
+            save_responded_at = NULL,
+            save_pending_expires_at = NULL
      WHERE id = @id AND state = 'active'`
   );
 
@@ -298,8 +355,17 @@ function createRoomRepository(db, opts = {}) {
       r.retention_tier,
       r.retention_until,
       r.retention_source,
+      r.save_state,
+      r.save_requested_by_device_id,
+      r.save_requested_at,
+      r.save_responded_at,
+      r.save_pending_expires_at,
       (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.id) AS member_count,
-      (SELECT COUNT(*) FROM room_messages msg WHERE msg.room_id = r.id) AS message_count
+      (SELECT COUNT(*) FROM room_messages msg WHERE msg.room_id = r.id) AS message_count,
+      (SELECT rm2.last_seen_at FROM room_members rm2
+        WHERE rm2.room_id = r.id AND rm2.device_id = @device_id) AS my_last_seen_at,
+      (SELECT rm3.last_live_chat_left_at FROM room_members rm3
+        WHERE rm3.room_id = r.id AND rm3.device_id = @device_id) AS my_last_live_chat_left_at
     FROM rooms r
     INNER JOIN device_room_links d ON d.room_id = r.id AND d.device_id = @device_id
     WHERE r.deleted_at IS NULL
@@ -310,6 +376,309 @@ function createRoomRepository(db, opts = {}) {
       )
     ORDER BY r.updated_at DESC, r.id DESC
   `);
+
+  function normalizeSaveStateRaw(raw) {
+    if (raw === "pending" || raw === "mutual") return raw;
+    return "none";
+  }
+
+  /**
+   * Compact mutual-save view for GET list/detail. `mutualSaveFeatureEnabled` mirrors env MUTUAL_SAVE_ENABLED.
+   * When false, clients only see { enabled: false, state: "none" } — no server save semantics exposed.
+   */
+  function buildSavePayload(room, viewerDeviceId, mutualSaveFeatureEnabled) {
+    const dev = typeof viewerDeviceId === "string" ? viewerDeviceId.trim() : "";
+    if (!mutualSaveFeatureEnabled) {
+      return { enabled: false, state: "none" };
+    }
+    if (!room) {
+      return { enabled: true, state: "none" };
+    }
+    const st = normalizeSaveStateRaw(room.save_state);
+    const reqBy = room.save_requested_by_device_id || null;
+    let myAction = "none";
+    if (st === "mutual") {
+      myAction = "mutual";
+    } else if (st === "pending") {
+      if (reqBy && dev && reqBy === dev) {
+        myAction = "requested";
+      } else if (reqBy && dev && reqBy !== dev) {
+        myAction = "can_respond";
+      }
+    }
+    let peerAction = "none";
+    if (st === "pending" && reqBy && dev) {
+      peerAction = reqBy === dev ? "awaiting_peer" : "pending_incoming";
+    } else if (st === "mutual") {
+      peerAction = "mutual";
+    }
+    return {
+      enabled: true,
+      state: st,
+      requestedByDeviceId: reqBy,
+      requestedAt: toIso(room.save_requested_at),
+      respondedAt: toIso(room.save_responded_at),
+      pendingExpiresAt: toIso(room.save_pending_expires_at),
+      myAction,
+      peerAction,
+    };
+  }
+
+  /**
+   * Viewer-scoped presence for list/detail: heartbeat vs explicit leave-live-chat.
+   */
+  function buildMyPresencePayload(row) {
+    const seen = row.my_last_seen_at;
+    const left = row.my_last_live_chat_left_at;
+    let likelyActiveInLiveChat = true;
+    if (left != null) {
+      if (seen == null || seen <= left) {
+        likelyActiveInLiveChat = false;
+      }
+    }
+    return {
+      lastSeenAt: toIso(seen),
+      lastLiveChatLeftAt: toIso(left),
+      likelyActiveInLiveChat,
+    };
+  }
+
+  /**
+   * POST /v2/rooms/:roomId/leave — device left live chat UI; room stays active (not POST /sessions/end).
+   */
+  function leaveLiveChatForLinkedDevice(roomId, deviceId) {
+    const dev = typeof deviceId === "string" ? deviceId.trim() : "";
+    if (!dev) {
+      return { ok: false, reason: "invalid_device" };
+    }
+    const room = stmtRoomById.get(roomId);
+    if (!room) {
+      return { ok: false, reason: "not_found" };
+    }
+    if (room.deleted_at != null) {
+      if (hasDeviceRoomLink.get(roomId, dev)) {
+        return { ok: false, reason: "deleted" };
+      }
+      return { ok: false, reason: "not_found" };
+    }
+    if (!hasDeviceRoomLink.get(roomId, dev)) {
+      return { ok: false, reason: "forbidden" };
+    }
+    if (room.state !== "active") {
+      return { ok: false, reason: "room_not_active" };
+    }
+
+    const t = nowMs();
+    const n = updateMemberLiveChatLeave.run({
+      t,
+      room_id: roomId,
+      device_id: dev,
+    }).changes;
+    if (n === 0) {
+      const link = db
+        .prepare(
+          `SELECT linked_at FROM device_room_links WHERE room_id = ? AND device_id = ?`
+        )
+        .get(roomId, dev);
+      const ja = link && link.linked_at != null ? link.linked_at : t;
+      insertMemberMinimal.run({
+        room_id: roomId,
+        device_id: dev,
+        joined_at: ja,
+        last_seen_at: null,
+        left_at: t,
+      });
+    }
+    db.prepare(`UPDATE rooms SET updated_at = ? WHERE id = ?`).run(t, roomId);
+    return { ok: true, lastLiveChatLeftAt: toIso(t) };
+  }
+
+  const updateSaveToPending = db.prepare(
+    `UPDATE rooms SET
+        save_state = 'pending',
+        save_requested_by_device_id = @save_requested_by_device_id,
+        save_requested_at = @save_requested_at,
+        save_responded_at = NULL,
+        save_pending_expires_at = @save_pending_expires_at,
+        updated_at = @updated_at
+     WHERE id = @id AND state = 'active' AND deleted_at IS NULL AND save_state = 'none'`
+  );
+
+  const updateSaveToMutualFromPending = db.prepare(
+    `UPDATE rooms SET
+        save_state = 'mutual',
+        save_requested_by_device_id = NULL,
+        save_requested_at = NULL,
+        save_responded_at = @save_responded_at,
+        save_pending_expires_at = NULL,
+        updated_at = @updated_at
+     WHERE id = @id AND save_state = 'pending'`
+  );
+
+  const updateSaveDeclineFromPending = db.prepare(
+    `UPDATE rooms SET
+        save_state = 'none',
+        save_requested_by_device_id = NULL,
+        save_requested_at = NULL,
+        save_responded_at = @save_responded_at,
+        save_pending_expires_at = NULL,
+        updated_at = @updated_at
+     WHERE id = @id AND save_state = 'pending'`
+  );
+
+  /**
+   * POST /v2/rooms/:roomId/save/request — 1:1 only; both devices must be in room_members.
+   * @returns {object} result with ok / reason / save
+   */
+  function requestMutualSaveForDevice(roomId, deviceId) {
+    const dev = typeof deviceId === "string" ? deviceId.trim() : "";
+    if (!dev) {
+      return { ok: false, reason: "invalid_device" };
+    }
+
+    const t = nowMs();
+    expireAllStalePendingSaves.run({ now: t, updated_at: t });
+
+    const room = stmtRoomById.get(roomId);
+    if (!room) {
+      return { ok: false, reason: "not_found" };
+    }
+    if (room.deleted_at != null) {
+      if (hasDeviceRoomLink.get(roomId, dev)) {
+        return { ok: false, reason: "deleted" };
+      }
+      return { ok: false, reason: "not_found" };
+    }
+    if (!hasDeviceRoomLink.get(roomId, dev)) {
+      return { ok: false, reason: "forbidden" };
+    }
+    if (room.state !== "active") {
+      return { ok: false, reason: "room_not_active" };
+    }
+
+    const nMembers = countDistinctMembers.get(roomId).c;
+    if (nMembers !== MAX_V1_DEVICES_PER_ROOM) {
+      return { ok: false, reason: "need_two_participants" };
+    }
+
+    const st = normalizeSaveStateRaw(room.save_state);
+    if (st === "mutual") {
+      return {
+        ok: true,
+        alreadyMutual: true,
+        save: buildSavePayload(room, dev, true),
+      };
+    }
+    if (st === "pending") {
+      if (room.save_requested_by_device_id === dev) {
+        const r2 = stmtRoomById.get(roomId);
+        return {
+          ok: true,
+          idempotent: true,
+          save: buildSavePayload(r2, dev, true),
+        };
+      }
+      return { ok: false, reason: "already_pending" };
+    }
+
+    const exp = t + savePendingDurationMs();
+    const n = updateSaveToPending.run({
+      id: roomId,
+      save_requested_by_device_id: dev,
+      save_requested_at: t,
+      save_pending_expires_at: exp,
+      updated_at: t,
+    }).changes;
+    if (n === 0) {
+      const r3 = stmtRoomById.get(roomId);
+      const st2 = normalizeSaveStateRaw(r3.save_state);
+      if (st2 === "mutual") {
+        return {
+          ok: true,
+          alreadyMutual: true,
+          save: buildSavePayload(r3, dev, true),
+        };
+      }
+      if (st2 === "pending" && r3.save_requested_by_device_id === dev) {
+        return {
+          ok: true,
+          idempotent: true,
+          save: buildSavePayload(r3, dev, true),
+        };
+      }
+      return { ok: false, reason: "race_or_invalid_state" };
+    }
+    const refreshed = stmtRoomById.get(roomId);
+    return { ok: true, save: buildSavePayload(refreshed, dev, true) };
+  }
+
+  /**
+   * POST /v2/rooms/:roomId/save/respond — only the non-requesting participant may respond.
+   */
+  function respondMutualSaveForDevice(roomId, deviceId, decision) {
+    const dev = typeof deviceId === "string" ? deviceId.trim() : "";
+    if (!dev) {
+      return { ok: false, reason: "invalid_device" };
+    }
+    const dec = decision === "accept" || decision === "decline" ? decision : null;
+    if (!dec) {
+      return { ok: false, reason: "invalid_decision" };
+    }
+
+    const t = nowMs();
+    expireAllStalePendingSaves.run({ now: t, updated_at: t });
+
+    const room = stmtRoomById.get(roomId);
+    if (!room) {
+      return { ok: false, reason: "not_found" };
+    }
+    if (room.deleted_at != null) {
+      if (hasDeviceRoomLink.get(roomId, dev)) {
+        return { ok: false, reason: "deleted" };
+      }
+      return { ok: false, reason: "not_found" };
+    }
+    if (!hasDeviceRoomLink.get(roomId, dev)) {
+      return { ok: false, reason: "forbidden" };
+    }
+
+    const st = normalizeSaveStateRaw(room.save_state);
+    if (st === "mutual") {
+      return { ok: false, reason: "already_mutual" };
+    }
+    if (st !== "pending") {
+      return { ok: false, reason: "not_pending" };
+    }
+
+    const requester = room.save_requested_by_device_id;
+    if (!requester || requester === dev) {
+      return { ok: false, reason: "wrong_responder" };
+    }
+
+    if (dec === "accept") {
+      const n = updateSaveToMutualFromPending.run({
+        id: roomId,
+        save_responded_at: t,
+        updated_at: t,
+      }).changes;
+      if (n === 0) {
+        return { ok: false, reason: "not_pending" };
+      }
+      const refreshed = stmtRoomById.get(roomId);
+      return { ok: true, save: buildSavePayload(refreshed, dev, true) };
+    }
+
+    const n = updateSaveDeclineFromPending.run({
+      id: roomId,
+      save_responded_at: t,
+      updated_at: t,
+    }).changes;
+    if (n === 0) {
+      return { ok: false, reason: "not_pending" };
+    }
+    const refreshed = stmtRoomById.get(roomId);
+    return { ok: true, save: buildSavePayload(refreshed, dev, true) };
+  }
 
   /**
    * Shape compatible with existing route logic: participants as array, active flag, etc.
@@ -538,6 +907,7 @@ function createRoomRepository(db, opts = {}) {
       });
       if (senderId && senderId !== "unknown") {
         linkDeviceToRoom(roomId, senderId, t);
+        clearMemberLiveChatLeave.run(roomId, senderId);
       }
     });
     tx();
@@ -557,6 +927,7 @@ function createRoomRepository(db, opts = {}) {
   /**
    * V2 message write: requires `device_room_links` (unlike V1 POST /messages which is sessionId-only).
    * Optional `senderId` must match `deviceId` when provided; default sender is `deviceId`.
+   * @returns {{ ok: true, message: object } | { ok: false, reason: 'not_found'|'deleted'|'ended'|'forbidden'|'sender_mismatch'|'inactive' }}
    */
   function appendMessageForLinkedDevice({
     roomId,
@@ -567,6 +938,16 @@ function createRoomRepository(db, opts = {}) {
     encrypted,
     fileName,
   }) {
+    const room = stmtRoomById.get(roomId);
+    if (!room) {
+      return { ok: false, reason: "not_found" };
+    }
+    if (room.deleted_at != null) {
+      return { ok: false, reason: "deleted" };
+    }
+    if (room.state !== "active") {
+      return { ok: false, reason: "ended" };
+    }
     if (!hasDeviceRoomLink.get(roomId, deviceId)) {
       return { ok: false, reason: "forbidden" };
     }
@@ -830,10 +1211,13 @@ function createRoomRepository(db, opts = {}) {
 
   /**
    * Rooms the device has ever been linked to (create/join/heartbeat), excluding soft-deleted rows.
-   * @param {{ deviceId: string, status?: string }} p
+   * @param {{ deviceId: string, status?: string, mutualSaveEnabled?: boolean }} p
    */
   function listRoomsForDevice(p) {
     const status = normalizeListStatus(p.status);
+    const t = nowMs();
+    expireAllStalePendingSaves.run({ now: t, updated_at: t });
+    const msEnabled = p.mutualSaveEnabled === true;
     const rows = selectRoomsForDevice.all({
       device_id: p.deviceId,
       status,
@@ -867,14 +1251,21 @@ function createRoomRepository(db, opts = {}) {
         messageCount: row.message_count,
         ...retentionViewForDevice(roomMini, p.deviceId),
         ...bridge,
+        save: buildSavePayload(row, p.deviceId, msEnabled),
+        myPresence: buildMyPresencePayload(row),
       };
     });
   }
 
   /**
+   * @param {{ mutualSaveEnabled?: boolean }} [opts]
    * @returns {{ ok: false, reason: 'not_found'|'forbidden' } | { ok: true, room: object }}
    */
-  function getRoomDetailForDevice(roomId, deviceId) {
+  function getRoomDetailForDevice(roomId, deviceId, opts = {}) {
+    const t = nowMs();
+    expireAllStalePendingSaves.run({ now: t, updated_at: t });
+    const msEnabled = opts.mutualSaveEnabled === true;
+
     const room = stmtRoomById.get(roomId);
     if (!room) {
       return { ok: false, reason: "not_found" };
@@ -900,7 +1291,18 @@ function createRoomRepository(db, opts = {}) {
       )
       .get(roomId, deviceId);
 
+    const memRow = db
+      .prepare(
+        `SELECT last_seen_at, last_live_chat_left_at FROM room_members WHERE room_id = ? AND device_id = ?`
+      )
+      .get(roomId, deviceId);
+
     const bridge = openChatInviteContract(room);
+
+    const myPresence = buildMyPresencePayload({
+      my_last_seen_at: memRow ? memRow.last_seen_at : null,
+      my_last_live_chat_left_at: memRow ? memRow.last_live_chat_left_at : null,
+    });
 
     return {
       ok: true,
@@ -919,6 +1321,8 @@ function createRoomRepository(db, opts = {}) {
         linkedAt: linkRow ? toIso(linkRow.linked_at) : null,
         ...retentionViewForDevice(room, deviceId),
         ...bridge,
+        save: buildSavePayload(room, deviceId, msEnabled),
+        myPresence,
       },
     };
   }
@@ -1082,6 +1486,9 @@ function createRoomRepository(db, opts = {}) {
     getRetentionForLinkedDevice,
     setRetentionManualForLinkedDevice,
     applyBillingRetentionEntitlement,
+    requestMutualSaveForDevice,
+    respondMutualSaveForDevice,
+    leaveLiveChatForLinkedDevice,
   };
 }
 

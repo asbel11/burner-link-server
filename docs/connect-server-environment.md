@@ -61,6 +61,47 @@ Optional tuning when legacy auto-end is on:
 
 See **`docs/session-lifecycle.md`**.
 
+## Mutual save (Room-Save-1A)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| **`MUTUAL_SAVE_ENABLED`** | **off** | `1` / `true` enables **`POST /v2/rooms/:id/save/request`** and **`.../save/respond`**; **`GET /v2/rooms*`** then exposes full `save` metadata. |
+| **`MUTUAL_SAVE_PENDING_MS`** | `604800000` (7d) | Pending request expires back to `none` after this duration. |
+
+See **`docs/v2-mutual-save.md`**.
+
+## Coin packs (`POST /v2/billing/create-coin-checkout-session`)
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| **`CONNECT_COIN_PACKS_JSON`** | **Yes** (for coin checkout) | JSON array: `{ "packId", "stripePriceId", "coins" }` per pack. If missing or empty → **`503`** `coin_packs_not_configured`. |
+| **`STRIPE_SECRET_KEY`** | **Yes** | Same as other Checkout flows; used to create the Checkout Session. |
+| **`STRIPE_CHECKOUT_SUCCESS_URL`** / **`STRIPE_CHECKOUT_CANCEL_URL`** | Conditional* | Same as membership/retention: defaults when **`successUrl`** / **`cancelUrl`** are omitted in the request body. |
+
+\* See **`docs/v2-coin-wallet-billing.md`** for the full contract (webhook crediting and **`GET /v2/billing/wallet`**).
+
+## Call charging (`POST /v2/billing/call-charge/start` and `.../settle`)
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| **`CONNECT_CALL_TARIFF_JSON`** | **Yes** (for these routes) | JSON object: **`version`**, **`voice.coinsPerSecond`**, **`video.coinsPerSecond`** (non-negative integers). Invalid or missing → **`503`** `tariff_not_configured`. |
+| **`CONNECT_CALL_DEFAULT_MIN_HOLD_SECONDS`** | No | Default **`estimatedBillableSeconds`** when omitted on **start** (default **`120`**). |
+
+See **`docs/connect-call-charging.md`**.
+
+## LiveKit media (`POST /v2/calls/livekit-token`)
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| **`LIVEKIT_URL`** | **Yes** | Client WebSocket URL (e.g. `wss://….livekit.cloud`). |
+| **`LIVEKIT_API_KEY`** | **Yes** | JWT issuer (`iss`). |
+| **`LIVEKIT_API_SECRET`** | **Yes** | HS256 signing secret — **server only**. |
+| **`LIVEKIT_TOKEN_TTL_SECONDS`** | No | Access token TTL in seconds (default **600**, allowed **60–86400**). |
+
+If **`LIVEKIT_URL`**, **`LIVEKIT_API_KEY`**, or **`LIVEKIT_API_SECRET`** is unset → **`503`** `livekit_not_configured`.
+
+See **`docs/connect-livekit-token.md`**.
+
 ## What still ends rooms (unchanged)
 
 - Clients calling **`POST /sessions/end`** or any product flow that maps to it.  

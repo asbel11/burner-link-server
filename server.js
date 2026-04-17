@@ -13,9 +13,22 @@ const { handleStripeWebhookPost } = require("./src/stripeWebhook");
 const { getStripeApiClient } = require("./src/stripeClient");
 const { createRetentionCheckoutSession } = require("./src/stripeCheckout");
 const { createMembershipCheckoutSession } = require("./src/stripeMembershipCheckout");
+const { createCoinPackCheckoutSession } = require("./src/stripeCoinPackCheckout");
 const { createConnectProPortalSession } = require("./src/stripeCustomerPortal");
 const { getCheckoutSessionSyncStatus } = require("./src/stripeCheckoutStatus");
 const { getEffectiveSessionHeartbeatAutoEnd } = require("./src/connectSessionPolicy");
+const {
+  resolveDeviceIdForV2MessagePost,
+  resolveSenderIdForV2MessagePost,
+} = require("./src/v2MessageRequest");
+const { mutualSaveEnabled } = require("./src/envFlags");
+const { processCoinSpendRequest } = require("./src/connectCoinSpend");
+const { getCallTariffFromEnv } = require("./src/connectCallTariff");
+const {
+  processCallChargeStart,
+  processCallChargeSettle,
+} = require("./src/connectCallBilling");
+const { processLivekitTokenRequest } = require("./src/livekitConnect");
 
 function envFlag(name, defaultValue = false) {
   const v = process.env[name];
@@ -34,7 +47,13 @@ app.post(
   "/v2/webhooks/stripe",
   express.raw({ type: "application/json" }),
   (req, res) => {
-    handleStripeWebhookPost(req, res, store.rooms, store.membership).catch((err) => {
+    handleStripeWebhookPost(
+      req,
+      res,
+      store.rooms,
+      store.membership,
+      store.coins
+    ).catch((err) => {
       console.error("Error in POST /v2/webhooks/stripe:", err);
       if (!res.headersSent) {
         res.status(500).json({ error: "Internal server error" });
@@ -293,6 +312,7 @@ app.get("/v2/rooms", (req, res) => {
     const rooms = store.rooms.listRoomsForDevice({
       deviceId: deviceId.trim(),
       status,
+      mutualSaveEnabled: mutualSaveEnabled(),
     });
     return res.json({ rooms });
   } catch (err) {
@@ -313,7 +333,9 @@ app.get("/v2/rooms/:roomId", (req, res) => {
       return res.status(400).json({ error: "Missing or invalid deviceId" });
     }
 
-    const detail = store.rooms.getRoomDetailForDevice(roomId, deviceId.trim());
+    const detail = store.rooms.getRoomDetailForDevice(roomId, deviceId.trim(), {
+      mutualSaveEnabled: mutualSaveEnabled(),
+    });
     if (!detail.ok) {
       if (detail.reason === "forbidden") {
         return res.status(403).json({ error: "Device is not a member of this room" });
@@ -369,7 +391,9 @@ app.get("/v2/rooms/:roomId/messages", (req, res) => {
 app.post("/v2/rooms/:roomId/messages", (req, res) => {
   try {
     const { roomId } = req.params;
-    const { deviceId, senderId, encrypted, type, fileName } = req.body || {};
+    const { encrypted, type, fileName } = req.body || {};
+    const deviceId = resolveDeviceIdForV2MessagePost(req);
+    const senderId = resolveSenderIdForV2MessagePost(req);
 
     if (!roomId || typeof roomId !== "string") {
       return res.status(400).json({ error: "Missing or invalid roomId" });
@@ -406,7 +430,16 @@ app.post("/v2/rooms/:roomId/messages", (req, res) => {
           error: "senderId must match deviceId when provided",
         });
       }
-      return res.status(404).json({ error: "Session not found or inactive" });
+      if (inserted.reason === "not_found") {
+        return res.status(404).json({ error: "Room not found" });
+      }
+      if (inserted.reason === "deleted") {
+        return res.status(410).json({ error: "Room was deleted" });
+      }
+      if (inserted.reason === "ended") {
+        return res.status(410).json({ error: "Room has ended" });
+      }
+      return res.status(404).json({ error: "Room not found or not active" });
     }
 
     const msg = inserted.message;
@@ -486,6 +519,47 @@ app.post("/v2/rooms/:roomId/reopen", (req, res) => {
   }
 });
 
+// Left live chat UI without ending the room (not V1 burn — use POST /sessions/end for that).
+// See docs/v2-room-live-chat-leave.md
+app.post("/v2/rooms/:roomId/leave", (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { deviceId } = req.body || {};
+    if (!roomId || typeof roomId !== "string") {
+      return res.status(400).json({ error: "Missing or invalid roomId" });
+    }
+    if (!isValidDeviceId(deviceId)) {
+      return res.status(400).json({ error: "Missing or invalid deviceId" });
+    }
+
+    const out = store.rooms.leaveLiveChatForLinkedDevice(roomId, deviceId.trim());
+    if (!out.ok) {
+      const errBodies = {
+        not_found: { status: 404, error: "Room not found" },
+        forbidden: { status: 403, error: "Device is not a member of this room" },
+        deleted: { status: 410, error: "Room was deleted" },
+        room_not_active: {
+          status: 409,
+          error: "Room is not active",
+        },
+      };
+      const mapped = errBodies[out.reason];
+      if (!mapped) {
+        console.error("leaveLiveChatForLinkedDevice unexpected:", out);
+        return res.status(500).json({ error: "Internal server error" });
+      }
+      return res.status(mapped.status).json({ error: mapped.error });
+    }
+    return res.status(200).json({
+      ok: true,
+      lastLiveChatLeftAt: out.lastLiveChatLeftAt,
+    });
+  } catch (err) {
+    console.error("Error in POST /v2/rooms/:roomId/leave:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // New 6-digit invite code; room id unchanged. Active, non-deleted rooms only.
 app.post("/v2/rooms/:roomId/rotate-invite-code", (req, res) => {
   try {
@@ -527,6 +601,107 @@ app.post("/v2/rooms/:roomId/rotate-invite-code", (req, res) => {
     });
   } catch (err) {
     console.error("Error in POST /v2/rooms/:roomId/rotate-invite-code:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ---------- Mutual save (Room-Save-1A) — gated by MUTUAL_SAVE_ENABLED ----------
+
+app.post("/v2/rooms/:roomId/save/request", (req, res) => {
+  try {
+    if (!mutualSaveEnabled()) {
+      return res.status(403).json({
+        error: "Mutual save is disabled on this server",
+        mutualSaveEnabled: false,
+      });
+    }
+    const { roomId } = req.params;
+    const { deviceId } = req.body || {};
+    if (!roomId || typeof roomId !== "string") {
+      return res.status(400).json({ error: "Missing or invalid roomId" });
+    }
+    if (!isValidDeviceId(deviceId)) {
+      return res.status(400).json({ error: "Missing or invalid deviceId" });
+    }
+
+    const out = store.rooms.requestMutualSaveForDevice(roomId, deviceId.trim());
+    if (!out.ok) {
+      const map = {
+        not_found: 404,
+        forbidden: 403,
+        deleted: 410,
+        room_not_active: 409,
+        need_two_participants: 409,
+        already_pending: 409,
+        race_or_invalid_state: 409,
+        invalid_device: 400,
+      };
+      const status = map[out.reason] || 400;
+      return res.status(status).json({ error: out.reason });
+    }
+    if (out.alreadyMutual) {
+      return res.status(200).json({
+        ok: true,
+        alreadyMutual: true,
+        save: out.save,
+      });
+    }
+    if (out.idempotent) {
+      return res.status(200).json({
+        ok: true,
+        idempotent: true,
+        save: out.save,
+      });
+    }
+    return res.status(200).json({ ok: true, save: out.save });
+  } catch (err) {
+    console.error("Error in POST /v2/rooms/:roomId/save/request:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/v2/rooms/:roomId/save/respond", (req, res) => {
+  try {
+    if (!mutualSaveEnabled()) {
+      return res.status(403).json({
+        error: "Mutual save is disabled on this server",
+        mutualSaveEnabled: false,
+      });
+    }
+    const { roomId } = req.params;
+    const { deviceId, decision } = req.body || {};
+    if (!roomId || typeof roomId !== "string") {
+      return res.status(400).json({ error: "Missing or invalid roomId" });
+    }
+    if (!isValidDeviceId(deviceId)) {
+      return res.status(400).json({ error: "Missing or invalid deviceId" });
+    }
+    if (decision !== "accept" && decision !== "decline") {
+      return res.status(400).json({ error: 'decision must be "accept" or "decline"' });
+    }
+
+    const out = store.rooms.respondMutualSaveForDevice(
+      roomId,
+      deviceId.trim(),
+      decision
+    );
+    if (!out.ok) {
+      const map = {
+        not_found: 404,
+        forbidden: 403,
+        deleted: 410,
+        wrong_responder: 403,
+        already_mutual: 409,
+        not_pending: 409,
+        invalid_device: 400,
+        invalid_decision: 400,
+      };
+      const status = map[out.reason] || 400;
+      return res.status(status).json({ error: out.reason });
+    }
+    return res.status(200).json({ ok: true, save: out.save });
+  } catch (err) {
+    console.error("Error in POST /v2/rooms/:roomId/save/respond:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -659,6 +834,153 @@ app.get("/v2/billing/membership", (req, res) => {
     return res.status(200).json(body);
   } catch (err) {
     console.error("Error in GET /v2/billing/membership:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// CONNECT coin pack checkout (one-time payment — Phase Coins-3)
+app.post("/v2/billing/create-coin-checkout-session", async (req, res) => {
+  try {
+    const { deviceId, packId, successUrl, cancelUrl } = req.body || {};
+    if (!isValidDeviceId(deviceId)) {
+      return res.status(400).json({ error: "Missing or invalid deviceId" });
+    }
+    if (!packId || typeof packId !== "string" || !packId.trim()) {
+      return res.status(400).json({
+        error: "Missing or invalid packId",
+        reason: "invalid_pack_id",
+      });
+    }
+
+    const stripe = getStripeApiClient();
+    if (!stripe) {
+      return res.status(503).json({
+        error: "Stripe API is not configured (set STRIPE_SECRET_KEY)",
+        reason: "stripe_not_configured",
+      });
+    }
+
+    const out = await createCoinPackCheckoutSession(stripe, {
+      deviceId: deviceId.trim(),
+      packId: packId.trim(),
+      successUrl,
+      cancelUrl,
+    });
+
+    if (!out.ok) {
+      if (out.reason === "coin_packs_not_configured") {
+        return res.status(503).json({
+          error:
+            "Coin packs are not configured (set CONNECT_COIN_PACKS_JSON)",
+          reason: "coin_packs_not_configured",
+          hint: out.hint,
+        });
+      }
+      if (out.reason === "unknown_pack_id") {
+        return res.status(400).json({
+          error: "Unknown packId",
+          reason: "unknown_pack_id",
+        });
+      }
+      if (out.reason === "missing_checkout_urls") {
+        return res.status(400).json({
+          error:
+            "Provide successUrl and cancelUrl in the JSON body, or set STRIPE_CHECKOUT_SUCCESS_URL and STRIPE_CHECKOUT_CANCEL_URL",
+          reason: "missing_checkout_urls",
+        });
+      }
+      if (out.reason === "invalid_device_id" || out.reason === "invalid_pack_id") {
+        return res.status(400).json({
+          error: "Missing or invalid deviceId or packId",
+          reason: out.reason,
+        });
+      }
+      return res.status(out.httpStatus || 400).json({
+        error: "Coin checkout session could not be created",
+        reason: out.reason,
+      });
+    }
+
+    const { ok: _ok, ...body } = out;
+    return res.status(200).json(body);
+  } catch (err) {
+    console.error("Error in POST /v2/billing/create-coin-checkout-session:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// CONNECT prepaid coin wallet (device-bound — Phase Coins-3)
+app.get("/v2/billing/wallet", (req, res) => {
+  try {
+    const deviceId = req.query.deviceId;
+    if (!isValidDeviceId(deviceId)) {
+      return res.status(400).json({ error: "Missing or invalid deviceId" });
+    }
+    const trimmed = deviceId.trim();
+    const row = store.coins.getWallet(trimmed);
+    if (!row) {
+      return res.status(200).json({
+        deviceId: trimmed,
+        availableCoins: 0,
+        reservedCoins: 0,
+        spendableCoins: 0,
+        updatedAt: null,
+      });
+    }
+    return res.status(200).json({
+      deviceId: row.deviceId,
+      availableCoins: row.availableCoins,
+      reservedCoins: row.reservedCoins,
+      spendableCoins: row.spendableCoins,
+      updatedAt: new Date(row.updatedAt).toISOString(),
+    });
+  } catch (err) {
+    console.error("Error in GET /v2/billing/wallet:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// CONNECT coin spend / debit (idempotent `call_debit` — Phase Call-Meter-1)
+app.post("/v2/billing/spend-coins", (req, res) => {
+  try {
+    const out = processCoinSpendRequest(store.coins, req.body || {});
+    return res.status(out.status).json(out.json);
+  } catch (err) {
+    console.error("Error in POST /v2/billing/spend-coins:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// CONNECT call charging — reserve + settle (Phase Call-Meter-2)
+app.post("/v2/billing/call-charge/start", (req, res) => {
+  try {
+    const tariff = getCallTariffFromEnv();
+    const out = processCallChargeStart(store.coins, req.body || {}, tariff);
+    return res.status(out.status).json(out.json);
+  } catch (err) {
+    console.error("Error in POST /v2/billing/call-charge/start:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/v2/billing/call-charge/settle", (req, res) => {
+  try {
+    const tariff = getCallTariffFromEnv();
+    const out = processCallChargeSettle(store.coins, req.body || {}, tariff);
+    return res.status(out.status).json(out.json);
+  } catch (err) {
+    console.error("Error in POST /v2/billing/call-charge/settle:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// CONNECT LiveKit access token (voice 1:1 — Phase Call-Arch-2)
+app.post("/v2/calls/livekit-token", async (req, res) => {
+  try {
+    const out = await processLivekitTokenRequest(store.rooms, req.body || {});
+    return res.status(out.status).json(out.json);
+  } catch (err) {
+    console.error("Error in POST /v2/calls/livekit-token:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -978,7 +1300,11 @@ app.get("/metrics/stats", (req, res) => {
 
 // ---------- Start server ----------
 
-const PORT = Number(process.env.PORT) || 4000;
-app.listen(PORT, () => {
-  console.log(`🔥 Burner Link server listening on port ${PORT}`);
-});
+if (require.main === module) {
+  const PORT = Number(process.env.PORT) || 4000;
+  app.listen(PORT, () => {
+    console.log(`🔥 Burner Link server listening on port ${PORT}`);
+  });
+}
+
+module.exports = { app };

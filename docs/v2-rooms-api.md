@@ -5,6 +5,7 @@
 - **Canonical id:** `room.id` === `v1SessionId` === V1 `sessionId` — **`docs/v1-v2-id-contract.md`**
 - **Open-chat invite availability (list + detail):** **`docs/v2-open-chat-invite.md`**
 - **V2 message transport (GET/POST messages):** **`docs/v2-message-transport.md`**
+- **Live chat leave (not burn):** **`docs/v2-room-live-chat-leave.md`**
 - **Retention (paid history foundation):** **`docs/v2-retention.md`**
 - **Lifecycle states, soft delete, reopen, invite rotation:** `docs/v2-room-lifecycle.md`
 
@@ -20,6 +21,7 @@
 - The caller passes **`deviceId`** as an opaque string (same model as V1 `deviceId` in create/join/heartbeat).
 - **Membership for V2** is defined by a row in **`device_room_links`**: the server records a link when a device **creates**, **joins**, **heartbeats**, or **posts a message** (non-`unknown` `senderId`) for that room.
 - **V1 burn** (`POST /sessions/end`) clears `room_members` and `room_messages` but **does not remove** `device_room_links`, so a device can still **list** and **open detail** for ended rooms (tombstones) while `memberCount` / `messageCount` reflect the burned state (`0`).
+- **Live chat leave** (`POST /v2/rooms/:roomId/leave`) records that this device left the **live chat UI** while keeping the room **active** — see **`docs/v2-room-live-chat-leave.md`** (distinct from **`/sessions/end`**).
 - **Soft-deleted rooms** (`rooms.deleted_at` set) are hidden from **list**; **detail/messages** return **410** for linked devices (see lifecycle doc). V1 sees the room as gone.
 
 ## Active vs ended in lists
@@ -65,12 +67,18 @@
       "canExtendRetention": true,
       "enforcementNote": "…",
       "memberCount": 2,
-      "messageCount": 4
+      "messageCount": 4,
+      "myPresence": {
+        "lastSeenAt": "2026-01-01T00:00:10.000Z",
+        "lastLiveChatLeftAt": null,
+        "likelyActiveInLiveChat": true
+      }
     }
   ]
 }
 ```
 
+- **`myPresence`:** viewer-only heartbeat / leave-live-chat summary — **`docs/v2-room-live-chat-leave.md`**.
 - **Retention fields** (`roomId`, `retentionTier`, `retentionUntil`, `retentionSource`, `isPaidRetention`, `canExtendRetention`, `enforcementNote`): same semantics as **`GET /v2/rooms/:roomId/retention`** — see **`docs/v2-retention.md`**. Verified grants: **`docs/v2-billing-ingestion.md`**, Stripe webhooks: **`docs/v2-stripe-webhooks.md`**, Stripe Checkout creation: **`docs/v2-stripe-checkout.md`**, post-return reliability: **`docs/v2-checkout-return-production.md`**.
 - **`openChatInviteAvailable` / `openChatInviteUnavailableReason`:** see **`docs/v2-open-chat-invite.md`** (when the V1 live-chat bridge may use **`inviteCode`**).
 - **`memberCount`**: live count from `room_members` (after V1 burn, `0`).
@@ -115,7 +123,12 @@
   "canExtendRetention": true,
   "enforcementNote": "…",
   "messageCount": 4,
-  "linkedAt": "2026-01-01T00:00:00.000Z"
+  "linkedAt": "2026-01-01T00:00:00.000Z",
+  "myPresence": {
+    "lastSeenAt": "2026-01-01T00:00:10.000Z",
+    "lastLiveChatLeftAt": null,
+    "likelyActiveInLiveChat": true
+  }
 }
 ```
 
@@ -206,11 +219,26 @@ Soft-delete. **200** `{ ok: true, deletedAt: "<ISO>" }` or `{ ok: true, alreadyD
 
 Only **ended** (burned) rooms. **200** `{ ok: true, room: { ... } }`. **409** if not ended. **410** if deleted. **403** / **404** as above.
 
+### `POST /v2/rooms/:roomId/leave`
+
+Leave the **live chat UI** without burning the room. **200** `{ ok: true, lastLiveChatLeftAt: "<ISO>" }`. **409** if the room is not active. Full contract: **`docs/v2-room-live-chat-leave.md`**.
+
 ### `POST /v2/rooms/:roomId/rotate-invite-code`
 
 Only **active** rooms. **200** includes `inviteCode`, `updatedAt`, `openChatInviteAvailable`, `openChatInviteUnavailableReason`, plus `roomId` / `v1SessionId` — see **`docs/v2-open-chat-invite.md`**. **409** not active. **410** deleted. **503** code allocation failed (retry).
 
 Full semantics: **`docs/v2-room-lifecycle.md`**.
+
+---
+
+## Mutual save (optional — `MUTUAL_SAVE_ENABLED`)
+
+Server truth for **both participants** agreeing to treat a 1:1 room as saved. Default **off**; list/detail always include a **`save`** object (when the flag is off, only `{ "enabled": false, "state": "none" }`).
+
+- **`POST /v2/rooms/:roomId/save/request`** — body `{ "deviceId" }`
+- **`POST /v2/rooms/:roomId/save/respond`** — body `{ "deviceId", "decision": "accept" | "decline" }`
+
+Contract and states: **`docs/v2-mutual-save.md`**.
 
 ---
 

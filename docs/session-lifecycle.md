@@ -37,6 +37,7 @@ This document matches the current server: V1 **routes** unchanged; persistence i
 
 - Validates `sessionId` and `deviceId`; requires an **active** session or returns `404`.
 - Adds `deviceId` to `participants` and updates `lastSeen[deviceId]`.
+- If the device had previously called **`POST /v2/rooms/:roomId/leave`**, heartbeat **clears** the live-chat-leave timestamp (same as sending a message) — see **`docs/v2-room-live-chat-leave.md`**.
 - **Auto-end (legacy Burner, opt-in):** If the **effective** `SESSION_HEARTBEAT_AUTO_END` is on, the legacy behavior can run: when at least two devices have `lastSeen` entries, if the **other** device’s `lastSeen` is older than `OFFLINE_TIMEOUT_MS` (default 30s) **and** `lastMessageAt` is older than `INACTIVITY_BEFORE_BURN_MS` (default 30s), the server sets `active: false`, clears `messages` and `participants`, and responds `{ ok: true, ended: true }`.
 - **CONNECT default:** `CONNECT_DISABLE_SESSION_AUTO_END` is treated as **on** when unset. That **blocks** `SESSION_HEARTBEAT_AUTO_END` even if a host template set it to `true`, so heartbeat only refreshes presence and does **not** end sessions. To restore old behavior, set `CONNECT_DISABLE_SESSION_AUTO_END=0` **and** `SESSION_HEARTBEAT_AUTO_END=1`. See **`docs/connect-server-environment.md`**.
 - **Without legacy auto-end:** Sessions end only via explicit `POST /sessions/end` (or loss of the SQLite file on ephemeral hosting).

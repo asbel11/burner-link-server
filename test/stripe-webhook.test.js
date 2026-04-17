@@ -6,6 +6,7 @@ const os = require("os");
 const Stripe = require("stripe");
 const { openDatabase } = require("../src/store/db");
 const { createRoomRepository } = require("../src/store/roomRepository");
+const { createCoinWalletRepository } = require("../src/store/coinWalletRepository");
 const { createDeviceMembershipStore } = require("../src/deviceMembership");
 const {
   handleStripeWebhookPost,
@@ -86,12 +87,15 @@ describe("handleStripeWebhookPost", () => {
   let dbPath;
   let rooms;
   let membership;
+  let coins;
   let prevWh;
   let prevSk;
+  let prevCoinPacks;
 
   before(() => {
     prevWh = process.env.STRIPE_WEBHOOK_SECRET;
     prevSk = process.env.STRIPE_SECRET_KEY;
+    prevCoinPacks = process.env.CONNECT_COIN_PACKS_JSON;
     process.env.STRIPE_WEBHOOK_SECRET = WH_SECRET;
     process.env.STRIPE_SECRET_KEY = "sk_test_phase21_not_for_charges";
 
@@ -101,6 +105,7 @@ describe("handleStripeWebhookPost", () => {
     );
     const db = openDatabase(dbPath);
     membership = createDeviceMembershipStore(db);
+    coins = createCoinWalletRepository(db);
     rooms = createRoomRepository(db, { membership });
     rooms.createRoomFromV1({
       id: "room-stripe",
@@ -114,6 +119,8 @@ describe("handleStripeWebhookPost", () => {
     else process.env.STRIPE_WEBHOOK_SECRET = prevWh;
     if (prevSk === undefined) delete process.env.STRIPE_SECRET_KEY;
     else process.env.STRIPE_SECRET_KEY = prevSk;
+    if (prevCoinPacks === undefined) delete process.env.CONNECT_COIN_PACKS_JSON;
+    else process.env.CONNECT_COIN_PACKS_JSON = prevCoinPacks;
 
     try {
       fs.unlinkSync(dbPath);
@@ -158,7 +165,7 @@ describe("handleStripeWebhookPost", () => {
       headers: { "stripe-signature": "t=1,v1=deadbeef" },
     };
     const res = mockRes();
-    await handleStripeWebhookPost(req, res, rooms, membership);
+    await handleStripeWebhookPost(req, res, rooms, membership, coins);
     assert.equal(res._o.statusCode, 400);
     assert.equal(res._o.body.reason, "invalid_signature");
   });
@@ -172,7 +179,7 @@ describe("handleStripeWebhookPost", () => {
     const { rawBody, header } = signStripeEvent(ev);
     const req = { body: rawBody, headers: { "stripe-signature": header } };
     const res = mockRes();
-    await handleStripeWebhookPost(req, res, rooms, membership);
+    await handleStripeWebhookPost(req, res, rooms, membership, coins);
     assert.equal(res._o.statusCode, 200);
     assert.equal(res._o.body.retentionTier, "30_days");
     assert.equal(res._o.body.retentionSource, "stripe");
@@ -188,14 +195,15 @@ describe("handleStripeWebhookPost", () => {
     const { rawBody, header } = signStripeEvent(ev);
     const req = { body: rawBody, headers: { "stripe-signature": header } };
     const res1 = mockRes();
-    await handleStripeWebhookPost(req, res1, rooms, membership);
+    await handleStripeWebhookPost(req, res1, rooms, membership, coins);
     assert.equal(res1._o.body.duplicate, false);
     const res2 = mockRes();
     await handleStripeWebhookPost(
       { body: rawBody, headers: { "stripe-signature": header } },
       res2,
       rooms,
-      membership
+      membership,
+      coins
     );
     assert.equal(res2._o.statusCode, 200);
     assert.equal(res2._o.body.duplicate, true);
@@ -213,7 +221,8 @@ describe("handleStripeWebhookPost", () => {
       { body: rawBody, headers: { "stripe-signature": header } },
       res,
       rooms,
-      membership
+      membership,
+      coins
     );
     assert.equal(res._o.statusCode, 400);
     assert.equal(res._o.body.reason, "invalid_retention_tier");
@@ -233,7 +242,8 @@ describe("handleStripeWebhookPost", () => {
       { body: rawBody, headers: { "stripe-signature": header } },
       res,
       rooms,
-      membership
+      membership,
+      coins
     );
     assert.equal(res._o.statusCode, 200);
     assert.equal(res._o.body.ignored, true);
@@ -264,7 +274,8 @@ describe("handleStripeWebhookPost", () => {
         { body: rawBody, headers: { "stripe-signature": header } },
         res,
         rooms,
-        membership
+        membership,
+        coins
       );
       assert.equal(res._o.statusCode, 400);
       assert.equal(res._o.body.reason, "missing_stripe_metadata");
@@ -300,9 +311,101 @@ describe("handleStripeWebhookPost", () => {
       { body: rawBody, headers: { "stripe-signature": header } },
       res,
       rooms,
-      membership
+      membership,
+      coins
     );
     assert.equal(res._o.statusCode, 200);
     assert.equal(res._o.body.retentionTier, "30_days");
+  });
+
+  test("coin_pack checkout.session.completed credits wallet", async () => {
+    process.env.CONNECT_COIN_PACKS_JSON = JSON.stringify([
+      { packId: "coins_100", stripePriceId: "price_test", coins: 100 },
+    ]);
+    const ev = checkoutEvent("evt_coin_pack_1", {
+      deviceId: "dev-coin-webhook",
+      packId: "coins_100",
+      connectBilling: "coin_pack",
+      coinsGranted: "100",
+    });
+    ev.data.object.payment_status = "paid";
+    ev.data.object.payment_intent = "pi_test_1";
+    const { rawBody, header } = signStripeEvent(ev);
+    const res = mockRes();
+    await handleStripeWebhookPost(
+      { body: rawBody, headers: { "stripe-signature": header } },
+      res,
+      rooms,
+      membership,
+      coins
+    );
+    assert.equal(res._o.statusCode, 200);
+    assert.equal(res._o.body.connectBilling, "coin_pack");
+    assert.equal(res._o.body.duplicate, false);
+    assert.equal(res._o.body.creditedCoins, 100);
+    assert.equal(res._o.body.availableCoins, 100);
+    const w = coins.getWallet("dev-coin-webhook");
+    assert.ok(w);
+    assert.equal(w.availableCoins, 100);
+  });
+
+  test("duplicate coin_pack Stripe event id does not double-credit", async () => {
+    process.env.CONNECT_COIN_PACKS_JSON = JSON.stringify([
+      { packId: "coins_50", stripePriceId: "price_test", coins: 50 },
+    ]);
+    const ev = checkoutEvent("evt_coin_dup", {
+      deviceId: "dev-coin-dup",
+      packId: "coins_50",
+      connectBilling: "coin_pack",
+      coinsGranted: "50",
+    });
+    ev.data.object.payment_status = "paid";
+    const { rawBody, header } = signStripeEvent(ev);
+    const res1 = mockRes();
+    await handleStripeWebhookPost(
+      { body: rawBody, headers: { "stripe-signature": header } },
+      res1,
+      rooms,
+      membership,
+      coins
+    );
+    assert.equal(res1._o.body.duplicate, false);
+    assert.equal(res1._o.body.creditedCoins, 50);
+    const res2 = mockRes();
+    await handleStripeWebhookPost(
+      { body: rawBody, headers: { "stripe-signature": header } },
+      res2,
+      rooms,
+      membership,
+      coins
+    );
+    assert.equal(res2._o.statusCode, 200);
+    assert.equal(res2._o.body.duplicate, true);
+    const w = coins.getWallet("dev-coin-dup");
+    assert.equal(w.availableCoins, 50);
+  });
+
+  test("coin_pack unknown packId → 400", async () => {
+    process.env.CONNECT_COIN_PACKS_JSON = JSON.stringify([
+      { packId: "coins_100", stripePriceId: "price_test", coins: 100 },
+    ]);
+    const ev = checkoutEvent("evt_coin_bad_pack", {
+      deviceId: "dev-x",
+      packId: "coins_999",
+      connectBilling: "coin_pack",
+      coinsGranted: "100",
+    });
+    ev.data.object.payment_status = "paid";
+    const { rawBody, header } = signStripeEvent(ev);
+    const res = mockRes();
+    await handleStripeWebhookPost(
+      { body: rawBody, headers: { "stripe-signature": header } },
+      res,
+      rooms,
+      membership,
+      coins
+    );
+    assert.equal(res._o.statusCode, 400);
+    assert.equal(res._o.body.reason, "invalid_pack_id");
   });
 });

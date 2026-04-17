@@ -235,6 +235,9 @@ function openDatabase(dbFilePath) {
   migrateRoomsRetention(db);
   migrateRetentionPurchasesIdempotency(db);
   migrateDeviceMembership(db);
+  migrateCoinWallet(db);
+  migrateMutualSave(db);
+  migrateRoomMemberLiveChatPresence(db);
 
   // Best-effort backfill for DBs created before device_room_links existed.
   db.exec(`
@@ -305,6 +308,47 @@ function migrateRetentionPurchasesIdempotency(db) {
 /**
  * Phase M2 — CONNECT membership (Stripe subscription) keyed by device_id; billing identity stays server-side.
  */
+/**
+ * Phase Room-Save-1A — server truth for mutual “save room” (1:1), optional client UX later.
+ * @see docs/v2-mutual-save.md
+ */
+function migrateMutualSave(db) {
+  const cols = db.prepare(`PRAGMA table_info(rooms)`).all();
+  const names = new Set(cols.map((c) => c.name));
+  if (!names.has("save_state")) {
+    db.exec(`ALTER TABLE rooms ADD COLUMN save_state TEXT NOT NULL DEFAULT 'none'`);
+  }
+  if (!names.has("save_requested_by_device_id")) {
+    db.exec(`ALTER TABLE rooms ADD COLUMN save_requested_by_device_id TEXT`);
+  }
+  if (!names.has("save_requested_at")) {
+    db.exec(`ALTER TABLE rooms ADD COLUMN save_requested_at INTEGER`);
+  }
+  if (!names.has("save_responded_at")) {
+    db.exec(`ALTER TABLE rooms ADD COLUMN save_responded_at INTEGER`);
+  }
+  if (!names.has("save_pending_expires_at")) {
+    db.exec(`ALTER TABLE rooms ADD COLUMN save_pending_expires_at INTEGER`);
+  }
+  db.exec(`
+    UPDATE rooms SET save_state = 'none' WHERE save_state IS NULL OR save_state = '';
+  `);
+}
+
+/**
+ * Phase Room-Save-1D — explicit “left live chat UI” without ending the room (`POST /v2/rooms/:id/leave`).
+ * @see docs/v2-room-live-chat-leave.md
+ */
+function migrateRoomMemberLiveChatPresence(db) {
+  const cols = db.prepare(`PRAGMA table_info(room_members)`).all();
+  const names = new Set(cols.map((c) => c.name));
+  if (!names.has("last_live_chat_left_at")) {
+    db.exec(
+      `ALTER TABLE room_members ADD COLUMN last_live_chat_left_at INTEGER`
+    );
+  }
+}
+
 function migrateDeviceMembership(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS device_memberships (
@@ -323,6 +367,41 @@ function migrateDeviceMembership(db) {
       kind TEXT NOT NULL,
       created_at INTEGER NOT NULL
     );
+  `);
+}
+
+/**
+ * Phase Coins-2 — prepaid coin wallet + append-only ledger (`deviceId`-bound).
+ * @see docs/connect-coins-wallet-design.md
+ */
+function migrateCoinWallet(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS device_coin_wallets (
+      device_id TEXT PRIMARY KEY,
+      available_coins INTEGER NOT NULL DEFAULT 0 CHECK (available_coins >= 0),
+      reserved_coins INTEGER NOT NULL DEFAULT 0 CHECK (reserved_coins >= 0),
+      updated_at INTEGER NOT NULL,
+      version INTEGER NOT NULL DEFAULT 0,
+      CHECK (reserved_coins <= available_coins)
+    );
+    CREATE TABLE IF NOT EXISTS coin_ledger_entries (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      delta_coins INTEGER NOT NULL,
+      balance_after INTEGER NOT NULL,
+      entry_kind TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      pack_id TEXT,
+      stripe_checkout_session_id TEXT,
+      stripe_payment_intent_id TEXT,
+      external_reference TEXT,
+      metadata_json TEXT,
+      FOREIGN KEY (device_id) REFERENCES device_coin_wallets(device_id),
+      UNIQUE (idempotency_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_coin_ledger_device_created
+      ON coin_ledger_entries (device_id, created_at DESC);
   `);
 }
 

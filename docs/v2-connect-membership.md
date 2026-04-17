@@ -149,3 +149,7 @@ When **`isMember`** is **`true`**, room list/detail/retention GET responses appl
 
 - No email or account id is required for chat or for membership APIs.
 - **`deviceId`** is the only client-supplied identity on **`GET /v2/billing/membership`** and **`POST /v2/billing/create-portal-session`** (Stripe resolves the linked customer server-side).
+
+## See also (prepaid balance)
+
+- Planned **device-bound coin wallet** (orthogonal to Pro subscription): **`docs/connect-coins-wallet-design.md`**.

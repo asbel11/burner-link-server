@@ -22,13 +22,17 @@ Invalid or missing signature → **`400`**, **`reason: invalid_signature`** or *
 
 | Event | Behavior |
 |-------|----------|
-| **`checkout.session.completed`** | Grants/extends retention from **`session.metadata`**. |
+| **`checkout.session.completed`** | If not handled as membership or **coin pack** (below), grants/extends retention from **`session.metadata`**. |
 | **`invoice.paid`** | Grants/extends from **`invoice.metadata`**, or from **subscription metadata** if **`STRIPE_SECRET_KEY`** is set and metadata was copied onto the Subscription. |
 | **All other types** | **`200`** `{ received: true, ignored: true, type }` — no entitlement change. |
 
 ### CONNECT Pro membership (subscription)
 
 If the session or subscription carries **`connectBilling=membership`** metadata, the server applies **device-level membership** first (see **`docs/v2-connect-membership.md`**) before the retention rules above. Retention-only Checkout remains **`mode: payment`**; membership Checkout uses **`mode: subscription`**.
+
+### CONNECT coin packs (one-time payment)
+
+If **`checkout.session.completed`** has **`mode: payment`** and **`metadata.connectBilling=coin_pack`**, the server credits the **device-bound coin wallet** (see **`docs/v2-coin-wallet-billing.md`**). **Idempotency key:** Stripe **`event.id`**. This path runs **before** retention metadata validation, so coin-only sessions do not require **`roomId`** / **`retentionTier`**.
 
 ## Required metadata (string keys)
 
