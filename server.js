@@ -15,6 +15,7 @@ const { createRetentionCheckoutSession } = require("./src/stripeCheckout");
 const { createMembershipCheckoutSession } = require("./src/stripeMembershipCheckout");
 const { createConnectProPortalSession } = require("./src/stripeCustomerPortal");
 const { getCheckoutSessionSyncStatus } = require("./src/stripeCheckoutStatus");
+const { getEffectiveSessionHeartbeatAutoEnd } = require("./src/connectSessionPolicy");
 
 function envFlag(name, defaultValue = false) {
   const v = process.env[name];
@@ -54,8 +55,12 @@ app.get("/", (req, res) => {
 const OFFLINE_TIMEOUT_MS = Number(process.env.OFFLINE_TIMEOUT_MS) || 30000;
 const INACTIVITY_BEFORE_BURN_MS =
   Number(process.env.INACTIVITY_BEFORE_BURN_MS) || 30000;
-// Default off: heartbeat must not end sessions after mobile idle-kill was disabled.
-const SESSION_HEARTBEAT_AUTO_END = envFlag("SESSION_HEARTBEAT_AUTO_END", false);
+// Effective only if CONNECT_DISABLE_SESSION_AUTO_END allows it (see docs/connect-server-environment.md).
+const SESSION_HEARTBEAT_AUTO_END = getEffectiveSessionHeartbeatAutoEnd();
+
+console.log(
+  `[connect] SESSION_HEARTBEAT_AUTO_END effective=${SESSION_HEARTBEAT_AUTO_END} (CONNECT_DISABLE_SESSION_AUTO_END unset blocks legacy auto-end; see docs/connect-server-environment.md)`
+);
 
 // Simple in-memory metrics (reset when server restarts)
 const metrics = {
@@ -176,8 +181,9 @@ app.get("/sessions/status/:sessionId", (req, res) => {
 });
 
 // Heartbeat route so each device can signal it is still connected. Optional
-// legacy behavior: if SESSION_HEARTBEAT_AUTO_END is set, stale peer + inactivity
-// can end the session (see docs/session-lifecycle.md).
+// legacy behavior: stale peer + inactivity can end the session only if both
+// CONNECT_DISABLE_SESSION_AUTO_END allows it and SESSION_HEARTBEAT_AUTO_END is on
+// (see docs/session-lifecycle.md and docs/connect-server-environment.md).
 app.post("/sessions/heartbeat", (req, res) => {
   try {
     const { sessionId, deviceId } = req.body || {};

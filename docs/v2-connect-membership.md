@@ -2,6 +2,8 @@
 
 Server-only billing identity is keyed by **`deviceId`** (same anonymous id as chat). This document covers checkout, Stripe webhooks, read-only status, and environment variables. Stripe customer/subscription identifiers are stored server-side and are **not** exposed on messaging routes or the membership status API.
 
+**Deployment checklist (Stripe keys, Checkout URLs, webhooks):** **`docs/connect-server-environment.md`**.
+
 ## Environment variables
 
 | Variable | Required | Purpose |

@@ -59,4 +59,4 @@ See `server.js` (routes) and `src/store/roomRepository.js` (persistence) for the
 | Variable | Purpose |
 |----------|---------|
 | `DATABASE_PATH` | Optional absolute or relative path to the SQLite file (default `data/burner-link.db`). |
-| `SESSION_HEARTBEAT_AUTO_END`, `OFFLINE_TIMEOUT_MS`, `INACTIVITY_BEFORE_BURN_MS` | Unchanged from Phase 3; see `docs/session-lifecycle.md`. |
+| `CONNECT_DISABLE_SESSION_AUTO_END`, `SESSION_HEARTBEAT_AUTO_END`, `OFFLINE_TIMEOUT_MS`, `INACTIVITY_BEFORE_BURN_MS` | Heartbeat auto-end policy: **`docs/connect-server-environment.md`** and **`docs/session-lifecycle.md`**. CONNECT defaults disable legacy auto-end when unset. |
