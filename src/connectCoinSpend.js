@@ -55,7 +55,8 @@ function ledgerEntryToResponseJson(e) {
 /**
  * Validates body and applies a `call_debit` ledger entry (idempotent).
  *
- * Trust model: same as `GET /v2/billing/wallet` — caller must know `deviceId`.
+ * Trust model: same as `GET /v2/billing/wallet` — caller must know `deviceId`
+ * (opaque bearer; no separate login). See `docs/LAUNCH_GAP_CHECKLIST.md`.
  * Optional server-side signing / internal-only routing can be layered later.
  *
  * @param {*} coins — repository from `createCoinWalletRepository`

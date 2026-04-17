@@ -29,6 +29,15 @@ const {
   processCallChargeSettle,
 } = require("./src/connectCallBilling");
 const { processLivekitTokenRequest } = require("./src/livekitConnect");
+const {
+  handlePrepareAttachment,
+  handleFinalizeAttachment,
+  handleDownloadAttachment,
+  handleCancelAttachment,
+} = require("./src/attachments/attachmentHttp");
+
+/** `package.json` version — exposed on `GET /v2/meta` for deploy verification. */
+const pkg = require("./package.json");
 
 function envFlag(name, defaultValue = false) {
   const v = process.env[name];
@@ -96,6 +105,31 @@ function createId() {
 
 function isValidDeviceId(deviceId) {
   return typeof deviceId === "string" && deviceId.trim().length > 0;
+}
+
+/**
+ * Stable machine-readable `reason` / `code` (same value) for clients; `error` is human-oriented
+ * when `message` is set, otherwise equals `reason`.
+ * @param {string} reason
+ * @param {string} [message]
+ * @param {Record<string, unknown>} [extra]
+ */
+function connectErr(reason, message, extra = {}) {
+  const errText = message != null && message !== "" ? message : reason;
+  return { error: errText, reason, code: reason, ...extra };
+}
+
+/**
+ * POST /v2/rooms/create body: camelCase preferred; snake_case aliases accepted.
+ * If both are present, camelCase wins.
+ */
+function pickV2RoomCreateBody(body) {
+  const b = body && typeof body === "object" && !Array.isArray(body) ? body : {};
+  const deviceId = b.deviceId !== undefined ? b.deviceId : b.device_id;
+  const inviteCode = b.inviteCode !== undefined ? b.inviteCode : b.invite_code;
+  const memberCap = b.memberCap !== undefined ? b.memberCap : b.member_cap;
+  const roomKind = b.roomKind !== undefined ? b.roomKind : b.room_kind;
+  return { deviceId, inviteCode, memberCap, roomKind };
 }
 
 /**
@@ -250,9 +284,21 @@ app.post("/sessions/join", (req, res) => {
   const joined = store.rooms.joinActiveRoomByCode({ inviteCode: code, deviceId });
   if (!joined.ok) {
     if (joined.reason === "full") {
-      return res
-        .status(403)
-        .json({ error: "Session already has two devices connected." });
+      const isDirect = (joined.roomKind || "direct") === "direct";
+      if (isDirect) {
+        return res.status(403).json(
+          connectErr(
+            "full",
+            "Session already has two devices connected."
+          )
+        );
+      }
+      return res.status(403).json({
+        ...connectErr("full", "Room is full"),
+        roomKind: joined.roomKind,
+        memberCap: joined.memberCap,
+        memberCount: joined.memberCount,
+      });
     }
     return res.status(404).json({ error: "Session not found or inactive" });
   }
@@ -262,7 +308,7 @@ app.post("/sessions/join", (req, res) => {
 });
 
 // End a session and burn its data
-app.post("/sessions/end", (req, res) => {
+app.post("/sessions/end", async (req, res) => {
   const { sessionId } = req.body;
 
   const outcome = store.rooms.endRoomBurnV1(sessionId);
@@ -275,6 +321,18 @@ app.post("/sessions/end", (req, res) => {
   }
   if (outcome.kind === "already_ended") {
     return res.status(200).json({ ok: true, alreadyEnded: true });
+  }
+
+  if (
+    outcome.s3KeysToDelete &&
+    outcome.s3KeysToDelete.length > 0 &&
+    store.attachmentStorage
+  ) {
+    try {
+      await store.attachmentStorage.deleteObjects(outcome.s3KeysToDelete);
+    } catch (err) {
+      console.error("S3 delete after room burn failed:", err);
+    }
   }
 
   console.log("Ended room (V1 burn)", sessionId);
@@ -331,6 +389,15 @@ app.post("/sessions/heartbeat", (req, res) => {
     }
 
     if (hb.ended) {
+      if (
+        hb.s3KeysToDelete &&
+        hb.s3KeysToDelete.length > 0 &&
+        store.attachmentStorage
+      ) {
+        store.attachmentStorage.deleteObjects(hb.s3KeysToDelete).catch((err) => {
+          console.error("S3 delete after heartbeat burn failed:", err);
+        });
+      }
       return res.json({ ok: true, ended: true });
     }
 
@@ -356,9 +423,10 @@ app.get("/messages/:sessionId", (req, res) => {
   res.json(session.messages);
 });
 
-// Post a new message (text or image)
+// Post a new message (text, image, or attachment-backed image/video/file)
 app.post("/messages", (req, res) => {
-  const { sessionId, senderId, encrypted, type, fileName } = req.body;
+  const { sessionId, senderId, encrypted, type, fileName, attachmentId } =
+    req.body || {};
 
   if (
     !encrypted ||
@@ -369,18 +437,62 @@ app.post("/messages", (req, res) => {
     return res.status(400).json({ error: "Missing encrypted payload" });
   }
 
+  let msgType = "text";
+  if (type === "image") msgType = "image";
+  else if (type === "video") msgType = "video";
+  else if (type === "file") msgType = "file";
+
   const id = createId();
 
   const inserted = store.rooms.appendMessageV1({
     roomId: sessionId,
     messageId: id,
     senderId: senderId || "unknown",
-    type: type === "image" ? "image" : "text",
+    type: msgType,
     encrypted,
     fileName: fileName || null,
+    attachmentId:
+      typeof attachmentId === "string" && attachmentId.trim()
+        ? attachmentId.trim()
+        : undefined,
   });
 
   if (!inserted.ok) {
+    if (inserted.reason === "payload_too_large") {
+      return res.status(413).json({
+        error: "Encrypted message payload exceeds server limits",
+        reason: "payload_too_large",
+      });
+    }
+    if (inserted.reason === "invalid_payload") {
+      return res.status(400).json({
+        error: "Invalid encrypted payload shape or fileName",
+        reason: "invalid_payload",
+      });
+    }
+    if (inserted.reason === "attachments_not_configured") {
+      return res.status(503).json({
+        error: "Attachments are not enabled on this server",
+        reason: "attachments_not_configured",
+      });
+    }
+    if (inserted.reason === "attachment_required") {
+      return res.status(400).json({
+        error: "video and file messages require a finalized attachment",
+        reason: "attachment_required",
+      });
+    }
+    if (
+      inserted.reason === "invalid_attachment" ||
+      inserted.reason === "attachment_not_ready" ||
+      inserted.reason === "attachment_already_linked" ||
+      inserted.reason === "attachment_type_mismatch"
+    ) {
+      return res.status(400).json({
+        error: "Invalid or unusable attachment reference",
+        reason: inserted.reason,
+      });
+    }
     return res.status(404).json({ error: "Session not found or inactive" });
   }
 
@@ -393,11 +505,118 @@ app.post("/messages", (req, res) => {
     type: msg.type,
     encrypted: msg.encrypted,
     fileName: msg.fileName,
+    ...(msg.attachment ? { attachment: msg.attachment } : {}),
   });
 });
 
 // ---------- CONNECT V2 room routes (device-scoped) ----------
 // V1 mobile continues to use /sessions/* and /messages/* only.
+
+/**
+ * Deploy / client probe: confirms this process includes the group-room API (avoids guessing on stale Railway builds).
+ * @see docs/deploy-verify-v2-api.md
+ */
+app.get("/v2/meta", (req, res) => {
+  try {
+    return res.status(200).json({
+      service: "burner-link-server",
+      version: pkg.version || "0.0.0",
+      connect: {
+        postGroupRoomCreate: {
+          method: "POST",
+          path: "/v2/rooms/create",
+          available: true,
+        },
+      },
+    });
+  } catch (err) {
+    console.error("Error in GET /v2/meta:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Create a group room (explicit cap). V1 `/sessions/create` remains direct 1:1 only — see docs/v2-rooms-create-contract.md.
+app.post("/v2/rooms/create", (req, res) => {
+  try {
+    const { deviceId, inviteCode, memberCap, roomKind: roomKindHint } =
+      pickV2RoomCreateBody(req.body);
+
+    if (roomKindHint !== undefined && roomKindHint !== null) {
+      const hint = String(roomKindHint).trim();
+      if (hint !== "" && hint.toLowerCase() !== "group") {
+        return res
+          .status(400)
+          .json(
+            connectErr(
+              "invalid_room_kind",
+              "This endpoint only creates group rooms; omit roomKind or set it to \"group\"."
+            )
+          );
+      }
+    }
+
+    if (!isValidDeviceId(deviceId)) {
+      return res
+        .status(400)
+        .json(
+          connectErr(
+            "invalid_device_id",
+            "Missing or invalid deviceId"
+          )
+        );
+    }
+    if (!inviteCode || typeof inviteCode !== "string" || !/^\d{6}$/.test(inviteCode)) {
+      return res
+        .status(400)
+        .json(
+          connectErr(
+            "invalid_invite_code",
+            "inviteCode must be a 6-digit string"
+          )
+        );
+    }
+
+    const out = store.rooms.createGroupRoomFromConnect({
+      id: createId(),
+      inviteCode,
+      creatorDeviceId: deviceId.trim(),
+      memberCap,
+    });
+    if (!out.ok) {
+      if (out.reason === "member_cap_out_of_range") {
+        return res.status(400).json({
+          ...connectErr("member_cap_out_of_range", "member_cap_out_of_range"),
+          min: out.min,
+          max: out.max,
+        });
+      }
+      if (out.reason === "invite_taken") {
+        return res.status(409).json(connectErr("invite_taken", "invite_taken"));
+      }
+      if (out.reason === "pro_required") {
+        return res.status(403).json(connectErr("pro_required", "pro_required"));
+      }
+      if (out.reason === "invalid_invite_code" || out.reason === "invalid_member_cap") {
+        return res.status(400).json(connectErr(out.reason, out.reason));
+      }
+      return res
+        .status(400)
+        .json(connectErr(out.reason || "invalid_request", out.reason || "invalid_request"));
+    }
+
+    return res.status(201).json({
+      ok: true,
+      roomId: out.roomId,
+      id: out.roomId,
+      roomKind: out.roomKind,
+      memberCap: out.memberCap,
+      inviteCode: out.inviteCode,
+    });
+  } catch (err) {
+    console.error("Error in POST /v2/rooms/create:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 // List rooms linked to this device (see docs/v2-rooms-api.md).
 // Query: deviceId (required), status=all|active|ended (default all).
@@ -496,7 +715,7 @@ app.get("/v2/rooms/:roomId/messages", (req, res) => {
 app.post("/v2/rooms/:roomId/messages", (req, res) => {
   try {
     const { roomId } = req.params;
-    const { encrypted, type, fileName } = req.body || {};
+    const { encrypted, type, fileName, attachmentId } = req.body || {};
     const deviceId = resolveDeviceIdForV2MessagePost(req);
     const senderId = resolveSenderIdForV2MessagePost(req);
 
@@ -515,18 +734,62 @@ app.post("/v2/rooms/:roomId/messages", (req, res) => {
       return res.status(400).json({ error: "Missing encrypted payload" });
     }
 
+    let msgType = "text";
+    if (type === "image") msgType = "image";
+    else if (type === "video") msgType = "video";
+    else if (type === "file") msgType = "file";
+
     const id = createId();
     const inserted = store.rooms.appendMessageForLinkedDevice({
       roomId,
       deviceId: deviceId.trim(),
       messageId: id,
       senderId,
-      type: type === "image" ? "image" : "text",
+      type: msgType,
       encrypted,
       fileName: fileName || null,
+      attachmentId:
+        typeof attachmentId === "string" && attachmentId.trim()
+          ? attachmentId.trim()
+          : undefined,
     });
 
     if (!inserted.ok) {
+      if (inserted.reason === "payload_too_large") {
+        return res.status(413).json({
+          error: "Encrypted message payload exceeds server limits",
+          reason: "payload_too_large",
+        });
+      }
+      if (inserted.reason === "invalid_payload") {
+        return res.status(400).json({
+          error: "Invalid encrypted payload shape or fileName",
+          reason: "invalid_payload",
+        });
+      }
+      if (inserted.reason === "attachments_not_configured") {
+        return res.status(503).json({
+          error: "Attachments are not enabled on this server",
+          reason: "attachments_not_configured",
+        });
+      }
+      if (inserted.reason === "attachment_required") {
+        return res.status(400).json({
+          error: "video and file messages require a finalized attachment",
+          reason: "attachment_required",
+        });
+      }
+      if (
+        inserted.reason === "invalid_attachment" ||
+        inserted.reason === "attachment_not_ready" ||
+        inserted.reason === "attachment_already_linked" ||
+        inserted.reason === "attachment_type_mismatch"
+      ) {
+        return res.status(400).json({
+          error: "Invalid or unusable attachment reference",
+          reason: inserted.reason,
+        });
+      }
       if (inserted.reason === "forbidden") {
         return res.status(403).json({ error: "Device is not a member of this room" });
       }
@@ -556,9 +819,77 @@ app.post("/v2/rooms/:roomId/messages", (req, res) => {
       type: msg.type,
       encrypted: msg.encrypted,
       fileName: msg.fileName,
+      ...(msg.attachment ? { attachment: msg.attachment } : {}),
     });
   } catch (err) {
     console.error("Error in POST /v2/rooms/:roomId/messages:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Object storage attachments (S3-compatible — see docs/connect-attachments-storage.md)
+app.post("/v2/rooms/:roomId/attachments/prepare", async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const out = await handlePrepareAttachment(store, roomId, req.body || {});
+    return res.status(out.status).json(out.json);
+  } catch (err) {
+    console.error("Error in POST /v2/rooms/:roomId/attachments/prepare:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post(
+  "/v2/rooms/:roomId/attachments/:attachmentId/finalize",
+  async (req, res) => {
+    try {
+      const { roomId, attachmentId } = req.params;
+      const out = await handleFinalizeAttachment(
+        store,
+        roomId,
+        attachmentId,
+        req.body || {}
+      );
+      return res.status(out.status).json(out.json);
+    } catch (err) {
+      console.error("Error in POST .../attachments/.../finalize:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+app.get(
+  "/v2/rooms/:roomId/attachments/:attachmentId/download-url",
+  async (req, res) => {
+    try {
+      const { roomId, attachmentId } = req.params;
+      const deviceId = req.query.deviceId;
+      const out = await handleDownloadAttachment(
+        store,
+        roomId,
+        attachmentId,
+        deviceId
+      );
+      return res.status(out.status).json(out.json);
+    } catch (err) {
+      console.error("Error in GET .../download-url:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+app.delete("/v2/rooms/:roomId/attachments/:attachmentId", async (req, res) => {
+  try {
+    const { roomId, attachmentId } = req.params;
+    const out = await handleCancelAttachment(
+      store,
+      roomId,
+      attachmentId,
+      req.body || {}
+    );
+    return res.status(out.status).json(out.json);
+  } catch (err) {
+    console.error("Error in DELETE .../attachments/:attachmentId:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -740,6 +1071,7 @@ app.post("/v2/rooms/:roomId/save/request", (req, res) => {
         already_pending: 409,
         race_or_invalid_state: 409,
         invalid_device: 400,
+        group_mutual_save_unsupported: 403,
       };
       const status = map[out.reason] || 400;
       return res.status(status).json({ error: out.reason });
@@ -800,6 +1132,7 @@ app.post("/v2/rooms/:roomId/save/respond", (req, res) => {
         not_pending: 409,
         invalid_device: 400,
         invalid_decision: 400,
+        group_mutual_save_unsupported: 403,
       };
       const status = map[out.reason] || 400;
       return res.status(status).json({ error: out.reason });

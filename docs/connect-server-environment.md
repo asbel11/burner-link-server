@@ -2,6 +2,42 @@
 
 Use this when deploying the **burner-link-server** (Railway, Docker, etc.). Values are read from `process.env` (see `require("dotenv").config()` in `server.js`).
 
+**Launch readiness (1:1 voice-only v1):** operator buckets, acceptable scope, and out-of-scope items — **`docs/LAUNCH_GAP_CHECKLIST.md`**.
+
+**Full product roadmap (media, groups, retention jobs, etc.):** **`docs/FULL_COMPLETION_SERVER_PLAN.md`**.
+
+## Encrypted message payload limits (`POST /messages`, `POST /v2/rooms/:roomId/messages`)
+
+Per-field bounds **after** JSON parse (see **`src/messagePayloadLimits.js`**). Oversized → **`413`** `payload_too_large`; malformed types → **`400`** `invalid_payload`. Independent of Express **`20mb`** body limit.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| **`CONNECT_MESSAGE_MAX_CIPHERTEXT_CHARS`** | `25000000` | Max length of **`encrypted.ciphertext`** string. |
+| **`CONNECT_MESSAGE_MAX_NONCE_CHARS`** | `4096` | Max length of **`encrypted.nonce`**. |
+| **`CONNECT_MESSAGE_MAX_FILENAME_CHARS`** | `1024` | Max **`fileName`** length when present. |
+
+See **`docs/connect-media-messages.md`**.
+
+## Object storage — message attachments (S3-compatible)
+
+Required for **`POST /v2/rooms/:roomId/attachments/prepare`** and related routes. Full contract: **`docs/connect-attachments-storage.md`**.
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| **`CONNECT_S3_BUCKET`** (or **`S3_BUCKET`**) | **Yes** (for attachments) | Bucket name. |
+| **`CONNECT_S3_REGION`** / **`AWS_REGION`** | **Yes** | Region string. |
+| **`CONNECT_S3_ACCESS_KEY_ID`** / **`AWS_ACCESS_KEY_ID`** | **Yes** | Access key. |
+| **`CONNECT_S3_SECRET_ACCESS_KEY`** / **`AWS_SECRET_ACCESS_KEY`** | **Yes** | Secret key (server only). |
+| **`CONNECT_S3_ENDPOINT`** | No | Non-AWS S3-compatible endpoint (R2, MinIO, …). |
+| **`CONNECT_S3_FORCE_PATH_STYLE`** | No | Often `1` with MinIO. |
+| **`CONNECT_ATTACHMENT_MAX_BYTES`** | No | Max declared object size (default **524288000**). |
+| **`CONNECT_S3_PRESIGN_PUT_SECONDS`** | No | Presigned PUT lifetime (default **900**). |
+| **`CONNECT_S3_PRESIGN_GET_SECONDS`** | No | Presigned GET lifetime (default **3600**). |
+
+## Billing identity (wallet / spend / call-charge)
+
+All coin and call-metering APIs key off **`deviceId`** (opaque string). **Knowing `deviceId` is sufficient to read balances and post charges** — same anonymous trust model as chat. There is **no** separate server-side login. Product/support should treat this as a **v1 limitation**; see **`docs/LAUNCH_GAP_CHECKLIST.md`**.
+
 ## Membership Checkout (`POST /v2/billing/create-membership-checkout-session`)
 
 The mobile error **`Stripe API is not configured (set STRIPE_SECRET_KEY)`** means **`getStripeApiClient()`** returned `null`: the Stripe **secret key** is missing or empty in that environment.
@@ -21,6 +57,10 @@ The mobile error **`Stripe API is not configured (set STRIPE_SECRET_KEY)`** mean
 |----------|---------|
 | **`STRIPE_WEBHOOK_SECRET`** | Verifies **`POST /v2/webhooks/stripe`**. **Does not** satisfy `STRIPE_SECRET_KEY`; Checkout still needs the secret key. |
 | **`STRIPE_SECRET_KEY`** | Still needed for membership **`invoice.paid`** / subscription retrieval paths that load the Subscription from Stripe. |
+
+**Stripe Dashboard:** create an endpoint pointing to your deployed API path **`/v2/webhooks/stripe`** (full URL, e.g. `https://api.example.com/v2/webhooks/stripe`). Subscribe to events your code handles (Checkout completed, subscription lifecycle, invoices — see **`docs/v2-stripe-webhooks.md`**).
+
+A separate verified-ingestion path exists at **`POST /v2/webhooks/billing`** for non-Stripe retention providers — do not confuse the two URLs.
 
 **Summary:** Set **`STRIPE_SECRET_KEY`** and **`STRIPE_PRICE_CONNECT_MEMBERSHIP`** on the same service that serves the API. Configure success/cancel URLs in Stripe Dashboard or env. Configure **`STRIPE_WEBHOOK_SECRET`** for webhooks in addition.
 
@@ -70,25 +110,52 @@ See **`docs/session-lifecycle.md`**.
 
 See **`docs/v2-mutual-save.md`**.
 
-## Coin packs (`POST /v2/billing/create-coin-checkout-session`)
+## Group rooms (`room_kind` / `member_cap`)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| **`CONNECT_GROUP_ROOMS_REQUIRE_PRO`** | **off** | When `1` / `true`, only devices with **active** CONNECT Pro membership may **`POST /v2/rooms/create`**. |
+| **`CONNECT_GROUP_MIN_MEMBER_CAP`** | **3** | Minimum allowed **`memberCap`** for group rooms (must be > 2 to distinguish from 1:1). |
+| **`CONNECT_GROUP_MAX_MEMBER_CAP`** | **100** | Maximum allowed **`memberCap`** (clamped server-side to a safe upper bound). |
+
+See **`docs/v2-group-rooms.md`**.
+
+## Coin packs
+
+**Routes:**
+
+| Route | Purpose |
+|-------|---------|
+| **`POST /v2/billing/create-coin-checkout-session`** | Body may include **`successUrl`** / **`cancelUrl`**, or use env defaults below. |
+| **`POST /v2/billing/coin-pack/create-checkout`** | Same **`deviceId`** + **`packId`**; server sets Stripe success/cancel to **`app://coin-pack-return?...&cr=<nonce>`** for mobile deep links; response may include **`checkoutReturnNonce`**. |
+
+**Catalog (at least one source required — merged; discrete env overrides JSON on same `packId`):**
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| **`CONNECT_COIN_PACKS_JSON`** | **Yes** (for coin checkout) | JSON array: `{ "packId", "stripePriceId", "coins" }` per pack. If missing or empty → **`503`** `coin_packs_not_configured`. |
-| **`STRIPE_SECRET_KEY`** | **Yes** | Same as other Checkout flows; used to create the Checkout Session. |
-| **`STRIPE_CHECKOUT_SUCCESS_URL`** / **`STRIPE_CHECKOUT_CANCEL_URL`** | Conditional* | Same as membership/retention: defaults when **`successUrl`** / **`cancelUrl`** are omitted in the request body. |
+| **`CONNECT_COIN_PACKS_JSON`** | Conditional | JSON array: `{ "packId", "stripePriceId", "coins" }` per pack. |
+| **`STRIPE_PRICE_COINS_100`** or **`STRIPE_PRICE_100`** | Conditional | If set → pack **`coins_100`** (100 coins) with this Stripe Price id. |
+| **`STRIPE_PRICE_COINS_300`** or **`STRIPE_PRICE_300`** | Conditional | Pack **`coins_300`** (300 coins). |
+| **`STRIPE_PRICE_COINS_1000`** or **`STRIPE_PRICE_1000`** | Conditional | Pack **`coins_1000`** (1000 coins). |
 
-\* See **`docs/v2-coin-wallet-billing.md`** for the full contract (webhook crediting and **`GET /v2/billing/wallet`**).
+If the **merged** catalog is empty → **`503`** `coin_packs_not_configured`.
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| **`STRIPE_SECRET_KEY`** | **Yes** | Creates Checkout Session. |
+| **`STRIPE_CHECKOUT_SUCCESS_URL`** / **`STRIPE_CHECKOUT_CANCEL_URL`** | Conditional* | Defaults for **`create-coin-checkout-session`** when URLs omitted in body. **Not** used for **`coin-pack/create-checkout`** (URLs are fixed `app://…`). |
+
+\* See **`docs/v2-coin-wallet-billing.md`** (webhook crediting, **`GET /v2/billing/wallet`**).
 
 ## Call charging (`POST /v2/billing/call-charge/start` and `.../settle`)
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| **`CONNECT_CALL_TARIFF_JSON`** | **Yes** (for these routes) | JSON object: **`version`**, **`voice.coinsPerSecond`**, **`video.coinsPerSecond`** (non-negative integers). Invalid or missing → **`503`** `tariff_not_configured`. |
+| **`CONNECT_CALL_TARIFF_JSON`** | **Yes** (for these routes) | JSON object: **`version`**, **`voice.coinsPerSecond`**, **`video.coinsPerSecond`** (non-negative integers). Invalid or missing → **`503`** `tariff_not_configured`. For **voice-only** public launch, set **`video.coinsPerSecond`** to **`0`** (field is still required by the parser). |
 | **`CONNECT_CALL_DEFAULT_MIN_HOLD_SECONDS`** | No | Default **`estimatedBillableSeconds`** when omitted on **start** (default **`120`**). |
-| **`CONNECT_FREE_CALL_SECONDS_PER_DAY`** | No | Daily free **call** seconds per **`deviceId`** (UTC day) before coin metering (default **`180`**). Set **`0`** to disable. |
+| **`CONNECT_FREE_CALL_SECONDS_PER_DAY`** | No | Daily free **call** seconds per **`deviceId`** (UTC calendar day) before coin metering (default **`180`**). Set **`0`** to disable. |
 
-See **`docs/connect-call-charging.md`** and **`docs/connect-call-free-allowance.md`**.
+See **`docs/connect-call-charging.md`** and **`docs/connect-call-free-allowance.md`**. **`POST /v2/calls/livekit-token`** accepts **`callType: voice` only** — video calls are not supported server-side regardless of tariff.
 
 ## LiveKit media (`POST /v2/calls/livekit-token`)
 
@@ -102,6 +169,12 @@ See **`docs/connect-call-charging.md`** and **`docs/connect-call-free-allowance.
 If **`LIVEKIT_URL`**, **`LIVEKIT_API_KEY`**, or **`LIVEKIT_API_SECRET`** is unset → **`503`** `livekit_not_configured`.
 
 See **`docs/connect-livekit-token.md`**.
+
+### Included retention tier for CONNECT Pro (API overlay)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| **`CONNECT_MEMBER_RETENTION_TIER`** | **`30_days`** (if invalid) | Minimum **displayed** retention tier for active members on room list/detail when membership store reports an active subscription. Does **not** delete messages; see **`docs/v2-retention.md`**. |
 
 ## What still ends rooms (unchanged)
 

@@ -12,7 +12,18 @@ const {
   computeCanExtendRetention,
 } = require("../retentionContract");
 const { getConnectMemberIncludedRetentionTier } = require("../connectMemberRetention");
+const {
+  validateEncryptedMessageContent,
+} = require("../messagePayloadLimits");
+const {
+  normalizeRoomKind,
+  effectiveJoinMemberCap,
+  parseGroupMemberCap,
+  groupRoomsRequirePro,
+  mutualSaveApplicableForRoom,
+} = require("../groupRoomPolicy");
 
+/** Legacy alias: direct (1:1) rooms always cap at 2 members. */
 const MAX_V1_DEVICES_PER_ROOM = 2;
 const INVITE_ROTATE_MAX_ATTEMPTS = 25;
 
@@ -29,13 +40,34 @@ function nowMs() {
 }
 
 function mapMessageRow(row) {
-  return {
+  const mt = row.msg_type;
+  let type = "text";
+  if (mt === "image" || mt === "video" || mt === "file") {
+    type = mt;
+  } else if (mt === "text") {
+    type = "text";
+  }
+  const out = {
     id: row.id,
     senderId: row.sender_id,
-    type: row.msg_type === "image" ? "image" : "text",
+    type,
     encrypted: { ciphertext: row.ciphertext, nonce: row.nonce },
     fileName: row.file_name,
   };
+  if (
+    row.attachment_id &&
+    row.att_mime_type != null &&
+    row.att_kind != null
+  ) {
+    out.attachment = {
+      id: row.attachment_id,
+      kind: row.att_kind,
+      mimeType: row.att_mime_type,
+      sizeBytes: row.att_size_bytes,
+      originalFilename: row.att_original_filename,
+    };
+  }
+  return out;
 }
 
 function toIso(ms) {
@@ -138,10 +170,11 @@ function retentionView(room) {
 
 /**
  * @param {import("better-sqlite3").Database} db
- * @param {{ membership?: object|null }} [opts]
+ * @param {{ membership?: object|null, attachments?: object|null }} [opts]
  */
 function createRoomRepository(db, opts = {}) {
   const membership = opts.membership || null;
+  const attachments = opts.attachments || null;
 
   /**
    * Effective retention for API responses: CONNECT membership includes a minimum paid tier without coins.
@@ -185,7 +218,7 @@ function createRoomRepository(db, opts = {}) {
     `SELECT id, invite_code, state, created_at, updated_at, ended_at, deleted_at,
             last_message_at, schema_version, retention_tier, retention_until, retention_source,
             save_state, save_requested_by_device_id, save_requested_at, save_responded_at,
-            save_pending_expires_at
+            save_pending_expires_at, room_kind, member_cap
      FROM rooms WHERE id = ?`
   );
 
@@ -226,9 +259,9 @@ function createRoomRepository(db, opts = {}) {
 
   const insertRoom = db.prepare(
     `INSERT INTO rooms (id, invite_code, state, created_at, updated_at, last_message_at,
-            retention_tier, retention_until, retention_source)
+            retention_tier, retention_until, retention_source, room_kind, member_cap)
      VALUES (@id, @invite_code, 'active', @created_at, @updated_at, @last_message_at,
-            'default', NULL, 'server_default')`
+            'default', NULL, 'server_default', @room_kind, @member_cap)`
   );
 
   const insertRetentionPurchase = db.prepare(
@@ -300,13 +333,18 @@ function createRoomRepository(db, opts = {}) {
   );
 
   const insertMessage = db.prepare(
-    `INSERT INTO room_messages (id, room_id, sender_id, msg_type, ciphertext, nonce, file_name, created_at)
-     VALUES (@id, @room_id, @sender_id, @msg_type, @ciphertext, @nonce, @file_name, @created_at)`
+    `INSERT INTO room_messages (id, room_id, sender_id, msg_type, ciphertext, nonce, file_name, created_at, attachment_id)
+     VALUES (@id, @room_id, @sender_id, @msg_type, @ciphertext, @nonce, @file_name, @created_at, @attachment_id)`
   );
 
   const selectMessages = db.prepare(
-    `SELECT id, sender_id, msg_type, ciphertext, nonce, file_name, created_at
-     FROM room_messages WHERE room_id = ? ORDER BY created_at ASC, id ASC`
+    `SELECT m.id, m.sender_id, m.msg_type, m.ciphertext, m.nonce, m.file_name, m.created_at, m.attachment_id,
+            a.kind AS att_kind, a.mime_type AS att_mime_type, a.size_bytes AS att_size_bytes,
+            a.original_filename AS att_original_filename
+     FROM room_messages m
+     LEFT JOIN room_attachments a ON m.attachment_id = a.id
+     WHERE m.room_id = ?
+     ORDER BY m.created_at ASC, m.id ASC`
   );
 
   const countActiveRooms = db.prepare(
@@ -352,6 +390,8 @@ function createRoomRepository(db, opts = {}) {
       r.updated_at,
       r.ended_at,
       r.last_message_at,
+      r.room_kind,
+      r.member_cap,
       r.retention_tier,
       r.retention_until,
       r.retention_source,
@@ -388,7 +428,7 @@ function createRoomRepository(db, opts = {}) {
    */
   function buildSavePayload(room, viewerDeviceId, mutualSaveFeatureEnabled) {
     const dev = typeof viewerDeviceId === "string" ? viewerDeviceId.trim() : "";
-    if (!mutualSaveFeatureEnabled) {
+    if (!mutualSaveApplicableForRoom(room, mutualSaveFeatureEnabled)) {
       return { enabled: false, state: "none" };
     }
     if (!room) {
@@ -556,6 +596,10 @@ function createRoomRepository(db, opts = {}) {
       return { ok: false, reason: "room_not_active" };
     }
 
+    if (normalizeRoomKind(room.room_kind) === "group") {
+      return { ok: false, reason: "group_mutual_save_unsupported" };
+    }
+
     const nMembers = countDistinctMembers.get(roomId).c;
     if (nMembers !== MAX_V1_DEVICES_PER_ROOM) {
       return { ok: false, reason: "need_two_participants" };
@@ -640,6 +684,10 @@ function createRoomRepository(db, opts = {}) {
     }
     if (!hasDeviceRoomLink.get(roomId, dev)) {
       return { ok: false, reason: "forbidden" };
+    }
+
+    if (normalizeRoomKind(room.room_kind) === "group") {
+      return { ok: false, reason: "group_mutual_save_unsupported" };
     }
 
     const st = normalizeSaveStateRaw(room.save_state);
@@ -732,6 +780,8 @@ function createRoomRepository(db, opts = {}) {
         created_at: t,
         updated_at: t,
         last_message_at: t,
+        room_kind: "direct",
+        member_cap: MAX_V1_DEVICES_PER_ROOM,
       });
       upsertMember.run({
         room_id: id,
@@ -744,13 +794,67 @@ function createRoomRepository(db, opts = {}) {
     tx();
   }
 
+  /**
+   * CONNECT group room (V2 only). Caller supplies a new room id and a free 6-digit invite code.
+   * @returns {{ ok: true, roomId: string, roomKind: 'group', memberCap: number, inviteCode: string } | { ok: false, reason: string, min?: number, max?: number }}
+   */
+  function createGroupRoomFromConnect({ id, inviteCode, creatorDeviceId, memberCap }) {
+    const dev =
+      typeof creatorDeviceId === "string" ? creatorDeviceId.trim() : "";
+    if (!dev) {
+      return { ok: false, reason: "invalid_device" };
+    }
+    if (!isValidSixDigitInviteCode(inviteCode)) {
+      return { ok: false, reason: "invalid_invite_code" };
+    }
+    const parsed = parseGroupMemberCap(memberCap);
+    if (!parsed.ok) {
+      return parsed;
+    }
+    if (groupRoomsRequirePro() && (!membership || !membership.isDeviceMember(dev))) {
+      return { ok: false, reason: "pro_required" };
+    }
+    if (findActiveRoomIdByInviteCode(inviteCode)) {
+      return { ok: false, reason: "invite_taken" };
+    }
+
+    const t = nowMs();
+    const cap = parsed.memberCap;
+    const tx = db.transaction(() => {
+      insertRoom.run({
+        id,
+        invite_code: inviteCode,
+        created_at: t,
+        updated_at: t,
+        last_message_at: t,
+        room_kind: "group",
+        member_cap: cap,
+      });
+      upsertMember.run({
+        room_id: id,
+        device_id: dev,
+        joined_at: t,
+        last_seen_at: t,
+      });
+      linkDeviceToRoom(id, dev, t);
+    });
+    tx();
+    return {
+      ok: true,
+      roomId: id,
+      roomKind: "group",
+      memberCap: cap,
+      inviteCode,
+    };
+  }
+
   function findActiveRoomIdByInviteCode(inviteCode) {
     const row = stmtActiveRoomIdByCode.get(inviteCode);
     return row ? row.id : null;
   }
 
   /**
-   * @returns {{ ok: true, roomId: string } | { ok: false, reason: 'not_found' | 'full' }}
+   * @returns {{ ok: true, roomId: string } | { ok: false, reason: 'not_found' | 'full', roomKind?: string, memberCap?: number, memberCount?: number }}
    */
   function joinActiveRoomByCode({ inviteCode, deviceId }) {
     const roomId = findActiveRoomIdByInviteCode(inviteCode);
@@ -773,8 +877,15 @@ function createRoomRepository(db, opts = {}) {
 
       if (!existing) {
         const n = countDistinctMembers.get(roomId).c;
-        if (n >= MAX_V1_DEVICES_PER_ROOM) {
-          return { ok: false, reason: "full" };
+        const cap = effectiveJoinMemberCap(room);
+        if (n >= cap) {
+          return {
+            ok: false,
+            reason: "full",
+            roomKind: normalizeRoomKind(room.room_kind),
+            memberCap: cap,
+            memberCount: n,
+          };
         }
       }
 
@@ -804,14 +915,20 @@ function createRoomRepository(db, opts = {}) {
       return { kind: "already_ended" };
     }
 
+    const s3KeysToDelete =
+      attachments != null ? attachments.listStorageKeysForRoom(roomId) : [];
+
     const t = nowMs();
     const tx = db.transaction(() => {
       deleteMessages.run(roomId);
+      if (attachments != null) {
+        attachments.deleteByRoom.run(roomId);
+      }
       deleteMembers.run(roomId);
       updateRoomEnded.run({ id: roomId, ended_at: t, updated_at: t });
     });
     tx();
-    return { kind: "ended" };
+    return { kind: "ended", s3KeysToDelete };
   }
 
   function touchHeartbeatV1({
@@ -862,14 +979,19 @@ function createRoomRepository(db, opts = {}) {
       now - refreshed.last_message_at > inactivityBeforeBurnMs;
 
     if (stale && inactiveLongEnough) {
+      const s3KeysToDelete =
+        attachments != null ? attachments.listStorageKeysForRoom(roomId) : [];
       const tx2 = db.transaction(() => {
         deleteMessages.run(roomId);
+        if (attachments != null) {
+          attachments.deleteByRoom.run(roomId);
+        }
         deleteMembers.run(roomId);
         updateRoomEnded.run({ id: roomId, ended_at: now, updated_at: now });
         // device_room_links intentionally retained for CONNECT room list.
       });
       tx2();
-      return { ok: true, ended: true };
+      return { ok: true, ended: true, s3KeysToDelete };
     }
 
     return { ok: true, ended: false };
@@ -882,11 +1004,60 @@ function createRoomRepository(db, opts = {}) {
     type,
     encrypted,
     fileName,
+    attachmentId,
   }) {
+    let attRow = null;
+    if (attachmentId != null && String(attachmentId).trim() !== "") {
+      const aid = String(attachmentId).trim();
+      if (!attachments) {
+        return { ok: false, reason: "attachments_not_configured" };
+      }
+      attRow = attachments.getById(aid);
+      if (!attRow || attRow.room_id !== roomId) {
+        return { ok: false, reason: "invalid_attachment" };
+      }
+      if (attRow.device_id !== senderId) {
+        return { ok: false, reason: "invalid_attachment" };
+      }
+      if (attRow.status !== "ready") {
+        return { ok: false, reason: "attachment_not_ready" };
+      }
+      if (attRow.message_id != null) {
+        return { ok: false, reason: "attachment_already_linked" };
+      }
+      const want =
+        type === "image" || type === "video" || type === "file"
+          ? type
+          : "text";
+      if (want === "text" || attRow.kind !== want) {
+        return { ok: false, reason: "attachment_type_mismatch" };
+      }
+    }
+
+    const wantType =
+      type === "image" || type === "video" || type === "file" ? type : "text";
+    if (
+      (wantType === "video" || wantType === "file") &&
+      !attRow
+    ) {
+      return { ok: false, reason: "attachment_required" };
+    }
+
+    const payload = validateEncryptedMessageContent(encrypted, fileName);
+    if (!payload.ok) {
+      return { ok: false, reason: payload.reason };
+    }
+
     const room = stmtRoomById.get(roomId);
     if (!room || room.state !== "active" || room.deleted_at != null) {
-      return { ok: false };
+      return { ok: false, reason: "inactive" };
     }
+
+    const msgTypeStored = attRow
+      ? attRow.kind
+      : type === "image"
+        ? "image"
+        : "text";
 
     const t = nowMs();
     const tx = db.transaction(() => {
@@ -894,12 +1065,24 @@ function createRoomRepository(db, opts = {}) {
         id: messageId,
         room_id: roomId,
         sender_id: senderId,
-        msg_type: type === "image" ? "image" : "text",
+        msg_type: msgTypeStored,
         ciphertext: encrypted.ciphertext,
         nonce: encrypted.nonce,
         file_name: fileName,
         created_at: t,
+        attachment_id: attRow ? attRow.id : null,
       });
+      if (attRow) {
+        const n = attachments.linkMessage.run({
+          id: attRow.id,
+          room_id: roomId,
+          message_id: messageId,
+          device_id: senderId,
+        }).changes;
+        if (n !== 1) {
+          throw new Error("attachment_link_failed");
+        }
+      }
       updateRoomLastMessage.run({
         id: roomId,
         last_message_at: t,
@@ -912,14 +1095,31 @@ function createRoomRepository(db, opts = {}) {
     });
     tx();
 
+    const displayType = attRow
+      ? attRow.kind
+      : type === "image"
+        ? "image"
+        : "text";
+
     return {
       ok: true,
       message: {
         id: messageId,
         senderId,
-        type: type === "image" ? "image" : "text",
+        type: displayType,
         encrypted,
         fileName,
+        ...(attRow
+          ? {
+              attachment: {
+                id: attRow.id,
+                kind: attRow.kind,
+                mimeType: attRow.mime_type,
+                sizeBytes: attRow.size_bytes,
+                originalFilename: attRow.original_filename,
+              },
+            }
+          : {}),
       },
     };
   }
@@ -927,7 +1127,7 @@ function createRoomRepository(db, opts = {}) {
   /**
    * V2 message write: requires `device_room_links` (unlike V1 POST /messages which is sessionId-only).
    * Optional `senderId` must match `deviceId` when provided; default sender is `deviceId`.
-   * @returns {{ ok: true, message: object } | { ok: false, reason: 'not_found'|'deleted'|'ended'|'forbidden'|'sender_mismatch'|'inactive' }}
+   * @returns {{ ok: true, message: object } | { ok: false, reason: 'not_found'|'deleted'|'ended'|'forbidden'|'sender_mismatch'|'inactive'|'payload_too_large'|'invalid_payload' }}
    */
   function appendMessageForLinkedDevice({
     roomId,
@@ -937,6 +1137,7 @@ function createRoomRepository(db, opts = {}) {
     type,
     encrypted,
     fileName,
+    attachmentId,
   }) {
     const room = stmtRoomById.get(roomId);
     if (!room) {
@@ -967,9 +1168,10 @@ function createRoomRepository(db, opts = {}) {
       type,
       encrypted,
       fileName,
+      attachmentId,
     });
     if (!out.ok) {
-      return { ok: false, reason: "inactive" };
+      return { ok: false, reason: out.reason };
     }
     return out;
   }
@@ -1223,6 +1425,13 @@ function createRoomRepository(db, opts = {}) {
       status,
     });
     return rows.map((row) => {
+      const rk = normalizeRoomKind(row.room_kind);
+      const cap =
+        typeof row.member_cap === "number" && row.member_cap >= 2
+          ? row.member_cap
+          : rk === "direct"
+            ? MAX_V1_DEVICES_PER_ROOM
+            : 2;
       const bridge = openChatInviteContract({
         state: row.state,
         invite_code: row.invite_code,
@@ -1241,6 +1450,8 @@ function createRoomRepository(db, opts = {}) {
         roomId: row.id,
         // Same as id; V1 live chat sessionId (see docs/v1-v2-id-contract.md).
         v1SessionId: row.id,
+        roomKind: rk,
+        memberCap: cap,
         inviteCode: row.invite_code,
         state: row.state,
         createdAt: toIso(row.created_at),
@@ -1304,12 +1515,22 @@ function createRoomRepository(db, opts = {}) {
       my_last_live_chat_left_at: memRow ? memRow.last_live_chat_left_at : null,
     });
 
+    const rkDetail = normalizeRoomKind(room.room_kind);
+    const capDetail =
+      typeof room.member_cap === "number" && room.member_cap >= 2
+        ? room.member_cap
+        : rkDetail === "direct"
+          ? MAX_V1_DEVICES_PER_ROOM
+          : 2;
+
     return {
       ok: true,
       room: {
         id: room.id,
         roomId: room.id,
         v1SessionId: room.id,
+        roomKind: rkDetail,
+        memberCap: capDetail,
         inviteCode: room.invite_code,
         state: room.state,
         createdAt: toIso(room.created_at),
@@ -1470,6 +1691,7 @@ function createRoomRepository(db, opts = {}) {
   return {
     getRoomAsV1Session,
     createRoomFromV1,
+    createGroupRoomFromConnect,
     findActiveRoomIdByInviteCode,
     joinActiveRoomByCode,
     endRoomBurnV1,

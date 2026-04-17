@@ -10,7 +10,7 @@ Set **`CONNECT_CALL_TARIFF_JSON`** to a JSON object:
 |-------|------|---------|
 | **`version`** | positive integer | Echoed in ledger **`metadata_json`** for audit (`tariffVersion`). |
 | **`voice.coinsPerSecond`** | non-negative integer | Voice rate: **`ceil(billedSeconds * coinsPerSecond)`** coins. |
-| **`video.coinsPerSecond`** | non-negative integer | Video rate (same formula). |
+| **`video.coinsPerSecond`** | non-negative integer | Video rate (same formula). **Not used** for **`POST /v2/calls/livekit-token`** — that route is **voice-only**. For a **voice-only public launch**, set **`video.coinsPerSecond`** to **`0`** so accidental **`callType: video`** on start/settle cannot charge coins while LiveKit still rejects video tokens. |
 
 Example:
 
@@ -18,7 +18,7 @@ Example:
 {
   "version": 1,
   "voice": { "coinsPerSecond": 1 },
-  "video": { "coinsPerSecond": 2 }
+  "video": { "coinsPerSecond": 0 }
 }
 ```
 

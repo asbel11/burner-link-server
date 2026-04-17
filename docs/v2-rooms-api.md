@@ -8,6 +8,8 @@
 - **Live chat leave (not burn):** **`docs/v2-room-live-chat-leave.md`**
 - **Retention (paid history foundation):** **`docs/v2-retention.md`**
 - **Lifecycle states, soft delete, reopen, invite rotation:** `docs/v2-room-lifecycle.md`
+- **Group rooms (multi-member, cap, Pro gate):** **`docs/v2-group-rooms.md`**
+- **Deploy / “route missing in prod”:** **`docs/deploy-verify-v2-api.md`** (`GET /v2/meta`)
 
 ## Durability (Railway / SQLite)
 
@@ -34,6 +36,37 @@
 
 ---
 
+## `GET /v2/meta`
+
+**No auth.** Returns **`service`**, **`version`** (from `package.json`), and **`connect.postGroupRoomCreate`** so operators and clients can confirm the deployment includes **`POST /v2/rooms/create`** (see **`docs/deploy-verify-v2-api.md`**).
+
+---
+
+## `POST /v2/rooms/create`
+
+Creates a **`group`** room with an explicit **`memberCap`** (V1 **`POST /sessions/create`** remains **direct** 1:1 only).
+
+**Body**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `deviceId` | yes | Creator device; must be unique in the room until others join. |
+| `inviteCode` | yes | **6-digit** string (`/^\d{6}$/`). Must not already be in use by another **active** room. |
+| `memberCap` | yes | Integer between server min/max (defaults **3**–**100**; see env). |
+
+**Responses**
+
+- **201** — `{ ok, roomId, id, roomKind: "group", memberCap, inviteCode }`
+- **400** — invalid `deviceId`, bad code shape, or `member_cap_out_of_range` (includes `min`, `max` when applicable)
+- **403** — `pro_required` when **`CONNECT_GROUP_ROOMS_REQUIRE_PRO`** is on and the device is not Pro
+- **409** — `invite_taken` (another active room already uses this code)
+
+Full semantics: **`docs/v2-group-rooms.md`**.
+
+**Locked request/response contract (keys, aliases, `code` / `reason`):** **`docs/v2-rooms-create-contract.md`**.
+
+---
+
 ## `GET /v2/rooms`
 
 **Query**
@@ -52,6 +85,8 @@
       "id": "uuid",
       "v1SessionId": "uuid",
       "inviteCode": "123456",
+      "roomKind": "direct",
+      "memberCap": 2,
       "state": "active",
       "openChatInviteAvailable": true,
       "openChatInviteUnavailableReason": null,
@@ -107,6 +142,8 @@
   "id": "uuid",
   "v1SessionId": "uuid",
   "inviteCode": "123456",
+  "roomKind": "direct",
+  "memberCap": 2,
   "state": "active",
   "openChatInviteAvailable": true,
   "openChatInviteUnavailableReason": null,

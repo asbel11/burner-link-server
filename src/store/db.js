@@ -239,6 +239,8 @@ function openDatabase(dbFilePath) {
   migrateCallFreeAllowance(db);
   migrateMutualSave(db);
   migrateRoomMemberLiveChatPresence(db);
+  migrateRoomAttachments(db);
+  migrateGroupRooms(db);
 
   // Best-effort backfill for DBs created before device_room_links existed.
   db.exec(`
@@ -390,6 +392,69 @@ function migrateCallFreeAllowance(db) {
     );
     CREATE INDEX IF NOT EXISTS idx_call_free_device_date
       ON device_daily_call_free_usage (device_id, usage_utc_date);
+  `);
+}
+
+/**
+ * Phase Media-Storage-1 — object storage-backed attachments (S3-compatible).
+ * @see docs/connect-attachments-storage.md
+ */
+function migrateRoomAttachments(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS room_attachments (
+      id TEXT PRIMARY KEY,
+      room_id TEXT NOT NULL,
+      device_id TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'ready', 'linked')),
+      kind TEXT NOT NULL CHECK (kind IN ('image', 'video', 'file')),
+      mime_type TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+      original_filename TEXT,
+      storage_key TEXT NOT NULL UNIQUE,
+      message_id TEXT UNIQUE,
+      created_at INTEGER NOT NULL,
+      finalized_at INTEGER,
+      FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_room_attachments_room
+      ON room_attachments (room_id);
+    CREATE INDEX IF NOT EXISTS idx_room_attachments_room_status
+      ON room_attachments (room_id, status);
+  `);
+
+  const msgCols = db.prepare(`PRAGMA table_info(room_messages)`).all();
+  const msgNames = new Set(msgCols.map((c) => c.name));
+  if (!msgNames.has("attachment_id")) {
+    db.exec(`ALTER TABLE room_messages ADD COLUMN attachment_id TEXT`);
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_room_messages_attachment_id
+        ON room_messages(attachment_id)
+        WHERE attachment_id IS NOT NULL
+    `);
+  }
+}
+
+/**
+ * Phase Group-Rooms-1 — `room_kind` + `member_cap` (direct = 1:1 cap 2; group = N-way up to cap).
+ * @see docs/v2-group-rooms.md
+ */
+function migrateGroupRooms(db) {
+  const cols = db.prepare(`PRAGMA table_info(rooms)`).all();
+  const names = new Set(cols.map((c) => c.name));
+  if (!names.has("room_kind")) {
+    db.exec(`
+      ALTER TABLE rooms ADD COLUMN room_kind TEXT NOT NULL DEFAULT 'direct'
+        CHECK (room_kind IN ('direct', 'group'))
+    `);
+  }
+  if (!names.has("member_cap")) {
+    db.exec(
+      `ALTER TABLE rooms ADD COLUMN member_cap INTEGER NOT NULL DEFAULT 2 CHECK (member_cap >= 2)`
+    );
+  }
+  db.exec(`
+    UPDATE rooms SET room_kind = 'direct' WHERE room_kind IS NULL OR room_kind = '';
+    UPDATE rooms SET member_cap = 2 WHERE room_kind = 'direct' OR room_kind IS NULL;
   `);
 }
 

@@ -2,7 +2,8 @@
  * Env-driven CONNECT call coin tariff (Phase Call-Meter-2).
  *
  * Set **`CONNECT_CALL_TARIFF_JSON`** to a JSON object, e.g.:
- * `{ "version": 1, "voice": { "coinsPerSecond": 1 }, "video": { "coinsPerSecond": 2 } }`
+ * `{ "version": 1, "voice": { "coinsPerSecond": 1 }, "video": { "coinsPerSecond": 0 } }`
+ * (**`video`** is required by the parser; use **`0`** for voice-only launch — see **`docs/connect-call-charging.md`**.)
  *
  * Costs use **`Math.ceil(billedSeconds * coinsPerSecond)`** (integer seconds × integer rate).
  *

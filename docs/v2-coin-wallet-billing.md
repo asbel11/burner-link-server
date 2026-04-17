@@ -2,9 +2,13 @@
 
 **Identity:** Balances are **device-bound only** (`deviceId`). Chat remains anonymous; there is **no** link to membership tier, retention purchases, or room billing in the wallet row.
 
+**Trust model (launch):** Anyone who can present a **`deviceId`** can read the wallet and post metered charges (same bearer model as anonymous chat). See **`docs/LAUNCH_GAP_CHECKLIST.md`**.
+
 ## Coin pack configuration
 
-Set **`CONNECT_COIN_PACKS_JSON`** to a JSON array of objects:
+The server merges **`CONNECT_COIN_PACKS_JSON`** with optional discrete env vars (**`STRIPE_PRICE_COINS_100`** / **`STRIPE_PRICE_100`**, and the **`300`** / **`1000`** variants — see **`src/coinPackCatalog.js`**). If the merged catalog is empty → **`503`** `coin_packs_not_configured`.
+
+Set **`CONNECT_COIN_PACKS_JSON`** to a JSON array of objects (optional if discrete prices cover all packs):
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -21,7 +25,7 @@ Example:
 ]
 ```
 
-Invalid rows are skipped. An empty or missing env value means **no packs** → checkout returns **`503`** `coin_packs_not_configured`.
+Invalid rows are skipped.
 
 See also **`docs/connect-server-environment.md`**.
 
@@ -40,11 +44,15 @@ See also **`docs/connect-server-environment.md`**.
 
 **Requires:** **`STRIPE_SECRET_KEY`**. If unset → **`503`** `stripe_not_configured`.
 
-**Success `200`:** `{ sessionId, url, packId, coins }` (plus any fields the implementation merges from the checkout helper).
+**Success `200`:** `{ sessionId, url, packId, coins }` (optional **`checkoutReturnNonce`** when the server adds it).
 
 **Checkout session metadata** (for webhooks and support):
 
-- **`deviceId`**, **`packId`**, **`connectBilling`:** `coin_pack`, **`coinsGranted`:** stringified coin count.
+- **`deviceId`**, **`packId`**, **`connectBilling`:** `coin_pack`, **`coinsGranted`:** stringified coin count; optional **`checkoutReturnNonce`** for client correlation.
+
+## `POST /v2/billing/coin-pack/create-checkout`
+
+Same body as above (**`deviceId`**, **`packId`**). Server sets Stripe **`success_url`** / **`cancel_url`** to **`app://coin-pack-return?status=success|cancel&cr=<nonce>`** and returns **`url`**, **`sessionId`**, **`packId`**, **`coins`**, **`checkoutReturnNonce`**. Requires **`STRIPE_SECRET_KEY`** and a non-empty merged pack catalog.
 
 ## `POST /v2/webhooks/stripe` (coin pack branch)
 
@@ -70,23 +78,26 @@ Unknown **`packId`** (not in catalog) → **`400`** `invalid_pack_id`.
 
 **Query:** **`deviceId`** (required, non-empty string).
 
-**`200` when no wallet row yet:**
+**`200` when no wallet row yet** (coin fields first, then device id, then free-allowance snapshot):
 
 ```json
 {
-  "deviceId": "...",
-  "availableCoins": 0,
-  "reservedCoins": 0,
   "spendableCoins": 0,
+  "reservedCoins": 0,
+  "availableCoins": 0,
+  "deviceId": "...",
   "updatedAt": null,
   "usageUtcDate": "2026-04-16",
   "callFreeSecondsAllowancePerDay": 180,
   "callFreeSecondsUsedToday": 0,
-  "callFreeSecondsRemainingToday": 180
+  "callFreeSecondsRemainingToday": 180,
+  "freeSecondsRemaining": 180,
+  "daily_free_seconds_used": 0,
+  "daily_free_reset_at": "2026-04-17T00:00:00.000Z"
 }
 ```
 
-**`200` when wallet exists:** same coin balance fields with **`updatedAt`** as ISO-8601, plus the **`callFree*`** / **`usageUtcDate`** fields above (see **`docs/connect-call-free-allowance.md`**). **Do not** compute free usage on the client.
+**`200` when wallet exists:** same shape; **`updatedAt`** as ISO-8601. See **`docs/connect-call-free-allowance.md`**. **Do not** compute free usage or balances on the client.
 
 ## `POST /v2/billing/spend-coins` (Phase Call-Meter-1)
 
@@ -135,6 +146,7 @@ Applies a **single idempotent debit** using ledger kind **`call_debit`**. Implem
 
 ## Related docs
 
+- **`docs/LAUNCH_GAP_CHECKLIST.md`** — operator launch gaps and acceptable v1 scope.
 - **`docs/connect-coins-wallet-design.md`** — ledger and schema design.
 - **`docs/connect-call-charging.md`** — tariff, **`call-charge/start`**, **`call-charge/settle`**, reserve + settlement (Phase Call-Meter-2).
 - **`docs/v2-stripe-webhooks.md`** — full webhook pipeline.

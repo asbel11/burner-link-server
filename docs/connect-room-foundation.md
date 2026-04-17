@@ -45,7 +45,8 @@ See `server.js` (routes) and `src/store/roomRepository.js` (persistence) for the
 
 - **Read:** `GET /v2/rooms`, `GET /v2/rooms/:roomId`, `GET /v2/rooms/:roomId/messages` — `docs/v2-rooms-api.md`.
 - **Writes:** `POST /v2/rooms/:roomId/delete`, `.../reopen`, `.../rotate-invite-code` — `docs/v2-room-lifecycle.md`.
-- **Mutual save (optional, `MUTUAL_SAVE_ENABLED`):** columns on `rooms` + `POST .../save/request` / `.../save/respond` — `docs/v2-mutual-save.md`.
+- **Mutual save (optional, `MUTUAL_SAVE_ENABLED`):** columns on `rooms` + `POST .../save/request` / `.../save/respond` — `docs/v2-mutual-save.md` (1:1 / `direct` only).
+- **Group rooms:** `rooms.room_kind` (`direct` \| `group`), `rooms.member_cap`, `POST /v2/rooms/create` — `docs/v2-group-rooms.md`.
 - V1 routes unchanged.
 
 ## What remains before mobile can consume “true” rooms end-to-end

@@ -1,5 +1,7 @@
 # V2 room retention (Phase 19–20 — hardened contract + billing ingestion)
 
+**Public launch v1:** message **TTL deletion is not enforced** in this server — tier fields are **stored and returned** with **`enforcementNote`**. Operator-facing scope and marketing alignment — **`docs/LAUNCH_GAP_CHECKLIST.md`**.
+
 ## Model
 
 - **Scope:** **Room-level** retention. All messages in a room share the same retention metadata on **`rooms`**. Per-message TTL in SQL can be added later without breaking this contract.
