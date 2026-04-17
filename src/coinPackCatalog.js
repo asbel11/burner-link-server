@@ -1,9 +1,62 @@
 /**
  * CONNECT coin pack definitions (Stripe Price ID + coin amount per pack).
- * Env **`CONNECT_COIN_PACKS_JSON`**: JSON array of `{ "packId", "stripePriceId", "coins" }`.
+ *
+ * - **`CONNECT_COIN_PACKS_JSON`**: JSON array of `{ "packId", "stripePriceId", "coins" }`.
+ * - Optional discrete env (merged; discrete wins on same **`packId`**):
+ *   **`STRIPE_PRICE_COINS_100`** / **`STRIPE_PRICE_100`** → **`coins_100`** (100 coins), etc.
  *
  * @see docs/v2-coin-wallet-billing.md
  */
+
+const DISCRETE_PACK_DEFS = Object.freeze([
+  {
+    packId: "coins_100",
+    coins: 100,
+    envKeys: ["STRIPE_PRICE_COINS_100", "STRIPE_PRICE_100"],
+  },
+  {
+    packId: "coins_300",
+    coins: 300,
+    envKeys: ["STRIPE_PRICE_COINS_300", "STRIPE_PRICE_300"],
+  },
+  {
+    packId: "coins_1000",
+    coins: 1000,
+    envKeys: ["STRIPE_PRICE_COINS_1000", "STRIPE_PRICE_1000"],
+  },
+]);
+
+/**
+ * @param {readonly string[]} envKeys
+ * @returns {string}
+ */
+function firstEnvTrimmed(envKeys) {
+  for (const k of envKeys) {
+    const v = process.env[k];
+    if (v != null && String(v).trim() !== "") {
+      return String(v).trim();
+    }
+  }
+  return "";
+}
+
+/**
+ * @returns {Array<{ packId: string, stripePriceId: string, coins: number }>}
+ */
+function parseDiscreteCoinPacksFromEnv() {
+  const out = [];
+  for (const def of DISCRETE_PACK_DEFS) {
+    const stripePriceId = firstEnvTrimmed(def.envKeys);
+    if (stripePriceId) {
+      out.push({
+        packId: def.packId,
+        stripePriceId,
+        coins: def.coins,
+      });
+    }
+  }
+  return out;
+}
 
 /**
  * @returns {Array<{ packId: string, stripePriceId: string, coins: number }>}
@@ -47,10 +100,20 @@ function parseCoinPacksFromEnv() {
 }
 
 /**
+ * JSON catalog + discrete env vars; later entries override same **`packId`**.
  * @returns {Array<{ packId: string, stripePriceId: string, coins: number }>}
  */
 function getCoinPackCatalog() {
-  return parseCoinPacksFromEnv();
+  const fromJson = parseCoinPacksFromEnv();
+  const fromDiscrete = parseDiscreteCoinPacksFromEnv();
+  const byId = new Map();
+  for (const p of fromJson) {
+    byId.set(p.packId, p);
+  }
+  for (const p of fromDiscrete) {
+    byId.set(p.packId, p);
+  }
+  return Array.from(byId.values());
 }
 
 /**
@@ -69,4 +132,5 @@ module.exports = {
   getCoinPackById,
   getCoinPackCatalog,
   parseCoinPacksFromEnv,
+  parseDiscreteCoinPacksFromEnv,
 };

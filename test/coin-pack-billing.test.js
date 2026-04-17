@@ -67,6 +67,30 @@ describe("createCoinPackCheckoutSession (unit)", () => {
     assert.equal(captured.metadata.coinsGranted, "100");
   });
 
+  test("checkoutReturnNonce is forwarded to Stripe metadata", async () => {
+    let captured;
+    const stripe = {
+      checkout: {
+        sessions: {
+          create: async (opts) => {
+            captured = opts;
+            return { id: "cs_nonce", url: "https://checkout.stripe.test/n" };
+          },
+        },
+      },
+    };
+    const out = await createCoinPackCheckoutSession(stripe, {
+      deviceId: "dev-unit",
+      packId: "coins_100",
+      successUrl: "https://example.com/ok",
+      cancelUrl: "https://example.com/cancel",
+      checkoutReturnNonce: "nonce-hex",
+    });
+    assert.equal(out.ok, true);
+    assert.equal(out.checkoutReturnNonce, "nonce-hex");
+    assert.equal(captured.metadata.checkoutReturnNonce, "nonce-hex");
+  });
+
   test("unknown packId → unknown_pack_id", async () => {
     const stripe = {
       checkout: { sessions: { create: async () => ({ id: "x", url: "y" }) } },
@@ -77,6 +101,27 @@ describe("createCoinPackCheckoutSession (unit)", () => {
     });
     assert.equal(out.ok, false);
     assert.equal(out.reason, "unknown_pack_id");
+  });
+
+  test("discrete env STRIPE_PRICE_COINS_100 supplies catalog when JSON empty", () => {
+    const prevJson = process.env.CONNECT_COIN_PACKS_JSON;
+    const prevP = process.env.STRIPE_PRICE_COINS_100;
+    process.env.CONNECT_COIN_PACKS_JSON = "[]";
+    process.env.STRIPE_PRICE_COINS_100 = "price_from_env";
+    delete require.cache[require.resolve("../src/coinPackCatalog.js")];
+    const { getCoinPackById: getById } = require("../src/coinPackCatalog");
+    try {
+      const p = getById("coins_100");
+      assert.ok(p);
+      assert.equal(p.stripePriceId, "price_from_env");
+      assert.equal(p.coins, 100);
+    } finally {
+      if (prevJson === undefined) delete process.env.CONNECT_COIN_PACKS_JSON;
+      else process.env.CONNECT_COIN_PACKS_JSON = prevJson;
+      if (prevP === undefined) delete process.env.STRIPE_PRICE_COINS_100;
+      else process.env.STRIPE_PRICE_COINS_100 = prevP;
+      delete require.cache[require.resolve("../src/coinPackCatalog.js")];
+    }
   });
 
   test("empty catalog → coin_packs_not_configured", async () => {
@@ -201,11 +246,12 @@ describe("Coin pack billing HTTP", () => {
       null
     );
     assert.equal(status, 200);
-    assert.equal(json.deviceId, "dev-new-wallet");
-    assert.equal(json.availableCoins, 0);
-    assert.equal(json.reservedCoins, 0);
     assert.equal(json.spendableCoins, 0);
+    assert.equal(json.reservedCoins, 0);
+    assert.equal(json.availableCoins, 0);
+    assert.equal(json.deviceId, "dev-new-wallet");
     assert.equal(json.updatedAt, null);
+    assert.ok(typeof json.daily_free_reset_at === "string");
   });
 
   test("GET wallet — after ledger credit", async () => {
@@ -224,14 +270,23 @@ describe("Coin pack billing HTTP", () => {
       null
     );
     assert.equal(status, 200);
-    assert.equal(json.availableCoins, 42);
     assert.equal(json.spendableCoins, 42);
     assert.equal(json.reservedCoins, 0);
+    assert.equal(json.availableCoins, 42);
     assert.ok(typeof json.updatedAt === "string");
   });
 
   test("POST create-coin-checkout-session — unknown pack", async () => {
     const { status, json } = await request("POST", "/v2/billing/create-coin-checkout-session", {
+      deviceId: "dev-a",
+      packId: "not_a_pack",
+    });
+    assert.equal(status, 400);
+    assert.equal(json.reason, "unknown_pack_id");
+  });
+
+  test("POST coin-pack/create-checkout — unknown pack", async () => {
+    const { status, json } = await request("POST", "/v2/billing/coin-pack/create-checkout", {
       deviceId: "dev-a",
       packId: "not_a_pack",
     });

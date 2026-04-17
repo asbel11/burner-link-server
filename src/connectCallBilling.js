@@ -1,7 +1,9 @@
 /**
  * CONNECT call charging — reserve at start, settle at end (Phase Call-Meter-2).
+ * Free daily seconds (Phase Billing-Free-Usage-1) apply before coin debit.
  *
  * @see docs/connect-call-charging.md
+ * @see docs/connect-call-free-allowance.md
  */
 
 const {
@@ -13,7 +15,6 @@ const {
   MAX_BILLABLE_SECONDS,
   MAX_ESTIMATE_SECONDS,
 } = require("./connectCallTariff");
-const { COIN_LEDGER_ENTRY_KINDS } = require("./coinEntryKinds");
 const {
   walletToResponseJson,
   ledgerEntryToResponseJson,
@@ -40,12 +41,32 @@ function normalizeCallSessionId(v) {
 }
 
 /**
+ * Canonical call-charge/start free fields: **`freeSecondsRemaining`** and **`willUseCoins`**
+ * (client must not infer coin usage from estimates alone).
+ *
+ * @param {Record<string, unknown>} freeJson
+ * @param {number} paidEstimateSeconds
+ */
+function augmentCallChargeStartFreeFields(freeJson, paidEstimateSeconds) {
+  const rem =
+    typeof freeJson.callFreeSecondsRemainingToday === "number"
+      ? freeJson.callFreeSecondsRemainingToday
+      : 0;
+  return {
+    ...freeJson,
+    freeSecondsRemaining: rem,
+    willUseCoins: paidEstimateSeconds > 0,
+  };
+}
+
+/**
  * @param {*} coins
  * @param {Record<string, unknown>} body
  * @param {ReturnType<typeof getCallTariffFromEnv>} tariff
+ * @param {{ callFree?: ReturnType<import("./callFreeAllowance").createCallFreeAllowance> }} [opts]
  * @returns {{ status: number, json: Record<string, unknown> }}
  */
-function processCallChargeStart(coins, body, tariff) {
+function processCallChargeStart(coins, body, tariff, opts = {}) {
   const raw = body && typeof body === "object" ? body : {};
   if (!tariff) {
     return {
@@ -106,8 +127,14 @@ function processCallChargeStart(coins, body, tariff) {
     callType === "voice"
       ? tariff.voice.coinsPerSecond
       : tariff.video.coinsPerSecond;
+
+  const freeSnap = opts.callFree
+    ? opts.callFree.getSnapshot(deviceId)
+    : null;
+  const remainingFree = freeSnap ? freeSnap.callFreeSecondsRemainingToday : 0;
+  const paidEstimateSeconds = Math.max(0, estimatedSeconds - remainingFree);
   const reserveCoins = computeReserveCoinsForEstimatedSeconds(
-    estimatedSeconds,
+    paidEstimateSeconds,
     callType,
     tariff
   );
@@ -118,10 +145,25 @@ function processCallChargeStart(coins, body, tariff) {
     callType,
     phase: "hold",
     estimatedBillableSeconds: estimatedSeconds,
+    paidEstimateSeconds,
+    remainingFreeSecondsBeforeHold: remainingFree,
     tariffVersion: tariff.version,
     coinsPerSecond,
     reserveCoins,
   });
+
+  const baseFreeJson = augmentCallChargeStartFreeFields(
+    freeSnap
+      ? {
+          usageUtcDate: freeSnap.usageUtcDate,
+          callFreeSecondsAllowancePerDay: freeSnap.callFreeSecondsAllowancePerDay,
+          callFreeSecondsUsedToday: freeSnap.callFreeSecondsUsedToday,
+          callFreeSecondsRemainingToday: freeSnap.callFreeSecondsRemainingToday,
+          estimatedCoinBillableSeconds: paidEstimateSeconds,
+        }
+      : {},
+    paidEstimateSeconds
+  );
 
   if (reserveCoins === 0) {
     const w = coins.getWallet(deviceId);
@@ -137,6 +179,7 @@ function processCallChargeStart(coins, body, tariff) {
         estimatedBillableSeconds: estimatedSeconds,
         reservedCoins: 0,
         holdApplied: false,
+        ...baseFreeJson,
         wallet:
           walletToResponseJson(w) ?? {
             deviceId,
@@ -166,6 +209,7 @@ function processCallChargeStart(coins, body, tariff) {
           reason: "insufficient_funds",
           callSessionId,
           reserveCoins,
+          ...baseFreeJson,
           wallet:
             walletToResponseJson(w) ?? {
               deviceId,
@@ -186,6 +230,22 @@ function processCallChargeStart(coins, body, tariff) {
     };
   }
 
+  const snapAfter = opts.callFree
+    ? opts.callFree.getSnapshot(deviceId)
+    : null;
+  const freeAfter = augmentCallChargeStartFreeFields(
+    snapAfter
+      ? {
+          usageUtcDate: snapAfter.usageUtcDate,
+          callFreeSecondsAllowancePerDay: snapAfter.callFreeSecondsAllowancePerDay,
+          callFreeSecondsUsedToday: snapAfter.callFreeSecondsUsedToday,
+          callFreeSecondsRemainingToday: snapAfter.callFreeSecondsRemainingToday,
+          estimatedCoinBillableSeconds: paidEstimateSeconds,
+        }
+      : {},
+    paidEstimateSeconds
+  );
+
   return {
     status: 200,
     json: {
@@ -198,6 +258,7 @@ function processCallChargeStart(coins, body, tariff) {
       estimatedBillableSeconds: estimatedSeconds,
       reservedCoins: reserveCoins,
       holdApplied: true,
+      ...freeAfter,
       wallet: walletToResponseJson(h.wallet),
     },
   };
@@ -207,9 +268,13 @@ function processCallChargeStart(coins, body, tariff) {
  * @param {*} coins
  * @param {Record<string, unknown>} body
  * @param {ReturnType<typeof getCallTariffFromEnv>} tariff
+ * @param {{
+ *   db?: import("better-sqlite3").Database,
+ *   callFree?: ReturnType<import("./callFreeAllowance").createCallFreeAllowance>,
+ * }} [opts]
  * @returns {{ status: number, json: Record<string, unknown> }}
  */
-function processCallChargeSettle(coins, body, tariff) {
+function processCallChargeSettle(coins, body, tariff, opts = {}) {
   const raw = body && typeof body === "object" ? body : {};
   if (!tariff) {
     return {
@@ -277,39 +342,212 @@ function processCallChargeSettle(coins, body, tariff) {
     reservedAmount = ra;
   }
 
-  const debitCoins = computeCoinsForBilledSeconds(bs, callType, tariff);
+  const settleKey = `call:${callSessionId}:settle`;
+  const existingDebit = coins.getLedgerEntryByIdempotencyKey(settleKey);
+  if (existingDebit) {
+    if (existingDebit.deviceId !== deviceId) {
+      return {
+        status: 409,
+        json: {
+          error: "settle idempotency key already used for another device",
+          reason: "idempotency_key_conflict",
+        },
+      };
+    }
+    const w = coins.getWallet(deviceId);
+    const releaseKey = `call:${callSessionId}:release`;
+    const rel = coins.getLedgerEntryByIdempotencyKey(releaseKey);
+    let meta = {};
+    try {
+      if (existingDebit.metadataJson) {
+        meta = JSON.parse(existingDebit.metadataJson);
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    const finalDebitCoins = Math.max(0, -(existingDebit.deltaCoins || 0));
+    const snap = opts.callFree ? opts.callFree.getSnapshot(deviceId) : null;
+    return {
+      status: 200,
+      json: {
+        ok: true,
+        duplicate: true,
+        callSessionId,
+        callType,
+        billedSeconds: bs,
+        tariffVersion: meta.tariffVersion ?? tariff.version,
+        releasedReserveCoins: reservedAmount,
+        finalDebitCoins,
+        freeSecondsApplied: meta.freeSecondsApplied,
+        coinBillableSeconds: meta.coinBillableSeconds,
+        ...(snap
+          ? {
+              usageUtcDate: snap.usageUtcDate,
+              callFreeSecondsAllowancePerDay: snap.callFreeSecondsAllowancePerDay,
+              callFreeSecondsUsedToday: snap.callFreeSecondsUsedToday,
+              callFreeSecondsRemainingToday: snap.callFreeSecondsRemainingToday,
+            }
+          : {}),
+        wallet:
+          walletToResponseJson(w) ?? {
+            deviceId,
+            availableCoins: 0,
+            reservedCoins: 0,
+            spendableCoins: 0,
+            updatedAt: null,
+          },
+        releaseEntry: rel ? ledgerEntryToResponseJson(rel) : null,
+        debitEntry: ledgerEntryToResponseJson(existingDebit),
+      },
+    };
+  }
+
   const releaseCoins = reservedAmount;
 
-  const releaseMeta = JSON.stringify({
-    callSessionId,
-    callType,
-    phase: "reserve_release",
-    releasedCoins: releaseCoins,
-    tariffVersion: tariff.version,
-  });
+  const runSettlement = (debitCoins, debitMetaObj, releaseMetaStr) => {
+    const releaseMeta = releaseCoins > 0 ? releaseMetaStr : null;
+    const debitMeta = JSON.stringify(debitMetaObj);
+    return coins.applyCallSessionSettlement({
+      deviceId,
+      sessionId: callSessionId,
+      releaseCoins,
+      debitCoins,
+      releaseMetadataJson: releaseMeta,
+      debitMetadataJson: debitMeta,
+      debitExternalReference: `call:${callSessionId}`,
+    });
+  };
 
-  const debitMeta = JSON.stringify({
-    callSessionId,
-    callType,
-    billedSeconds: bs,
-    tariffVersion: tariff.version,
-    reservedAmount: releaseCoins,
-    finalDebitCoins: debitCoins,
-  });
+  if (!opts.callFree || !opts.db) {
+    const debitCoins = computeCoinsForBilledSeconds(bs, callType, tariff);
+    const releaseMeta = JSON.stringify({
+      callSessionId,
+      callType,
+      phase: "reserve_release",
+      releasedCoins: releaseCoins,
+      tariffVersion: tariff.version,
+    });
+    const debitMeta = {
+      callSessionId,
+      callType,
+      billedSeconds: bs,
+      tariffVersion: tariff.version,
+      reservedAmount: releaseCoins,
+      finalDebitCoins: debitCoins,
+      freeSecondsApplied: 0,
+      coinBillableSeconds: bs,
+    };
+    const r = runSettlement(debitCoins, debitMeta, releaseMeta);
+    return finishSettleResponse(r, {
+      coins,
+      deviceId,
+      callSessionId,
+      callType,
+      bs,
+      releaseCoins,
+      debitCoins,
+      freeSecondsApplied: 0,
+      coinBillableSeconds: bs,
+      callFreeSnapshot: null,
+      tariff,
+    });
+  }
 
-  const r = coins.applyCallSessionSettlement({
+  let alloc;
+  let debitCoins;
+  try {
+    opts.db.transaction(() => {
+      alloc = opts.callFree.consumeAgainstAllowanceInTransaction(deviceId, bs);
+      debitCoins = computeCoinsForBilledSeconds(
+        alloc.coinBillableSeconds,
+        callType,
+        tariff
+      );
+      const releaseMeta = JSON.stringify({
+        callSessionId,
+        callType,
+        phase: "reserve_release",
+        releasedCoins: releaseCoins,
+        tariffVersion: tariff.version,
+      });
+      const debitMeta = {
+        callSessionId,
+        callType,
+        billedSeconds: bs,
+        tariffVersion: tariff.version,
+        reservedAmount: releaseCoins,
+        finalDebitCoins: debitCoins,
+        freeSecondsApplied: alloc.freeSecondsApplied,
+        coinBillableSeconds: alloc.coinBillableSeconds,
+      };
+      const r = runSettlement(debitCoins, debitMeta, releaseMeta);
+      if (!r.ok) {
+        const err = new Error("SETTLE_FAIL");
+        err.settleReason = r.reason;
+        throw err;
+      }
+    })();
+  } catch (e) {
+    if (e && e.settleReason) {
+      const r = { ok: false, reason: e.settleReason };
+      return finishSettleResponse(r, {
+        coins,
+        deviceId,
+        callSessionId,
+        callType,
+        bs,
+        releaseCoins,
+        debitCoins: debitCoins ?? 0,
+        freeSecondsApplied: alloc?.freeSecondsApplied,
+        coinBillableSeconds: alloc?.coinBillableSeconds,
+        callFreeSnapshot: opts.callFree.getSnapshot(deviceId),
+        tariff,
+      });
+    }
+    throw e;
+  }
+
+  const snap = opts.callFree.getSnapshot(deviceId);
+  return finishSettleResponse(
+    { ok: true, duplicate: false },
+    {
+      coins,
+      deviceId,
+      callSessionId,
+      callType,
+      bs,
+      releaseCoins,
+      debitCoins,
+      freeSecondsApplied: alloc.freeSecondsApplied,
+      coinBillableSeconds: alloc.coinBillableSeconds,
+      callFreeSnapshot: snap,
+      tariff,
+    }
+  );
+}
+
+/**
+ * @param {*} coins
+ * @param {object} p
+ */
+function finishSettleResponse(r, p) {
+  const {
+    coins: coinsRepo,
     deviceId,
-    sessionId: callSessionId,
+    callSessionId,
+    callType,
+    bs,
     releaseCoins,
     debitCoins,
-    releaseMetadataJson: releaseCoins > 0 ? releaseMeta : null,
-    debitMetadataJson: debitMeta,
-    debitExternalReference: `call:${callSessionId}`,
-  });
+    freeSecondsApplied,
+    coinBillableSeconds,
+    callFreeSnapshot,
+    tariff,
+  } = p;
 
   if (!r.ok) {
     if (r.reason === "insufficient_funds") {
-      const w = coins.getWallet(deviceId);
+      const w = coinsRepo.getWallet(deviceId);
       return {
         status: 402,
         json: {
@@ -317,6 +555,18 @@ function processCallChargeSettle(coins, body, tariff) {
           reason: "insufficient_funds",
           callSessionId,
           finalDebitCoins: debitCoins,
+          freeSecondsApplied,
+          coinBillableSeconds,
+          ...(callFreeSnapshot
+            ? {
+                usageUtcDate: callFreeSnapshot.usageUtcDate,
+                callFreeSecondsAllowancePerDay:
+                  callFreeSnapshot.callFreeSecondsAllowancePerDay,
+                callFreeSecondsUsedToday: callFreeSnapshot.callFreeSecondsUsedToday,
+                callFreeSecondsRemainingToday:
+                  callFreeSnapshot.callFreeSecondsRemainingToday,
+              }
+            : {}),
           wallet:
             walletToResponseJson(w) ?? {
               deviceId,
@@ -329,14 +579,27 @@ function processCallChargeSettle(coins, body, tariff) {
       };
     }
     if (r.reason === "insufficient_reserved") {
-      const w = coins.getWallet(deviceId);
+      const w = coinsRepo.getWallet(deviceId);
       return {
         status: 402,
         json: {
-          error: "Reserved coins on wallet are less than reservedAmount for this session",
+          error:
+            "Reserved coins on wallet are less than reservedAmount for this session",
           reason: "insufficient_reserved",
           callSessionId,
           reservedAmount: releaseCoins,
+          freeSecondsApplied,
+          coinBillableSeconds,
+          ...(callFreeSnapshot
+            ? {
+                usageUtcDate: callFreeSnapshot.usageUtcDate,
+                callFreeSecondsAllowancePerDay:
+                  callFreeSnapshot.callFreeSecondsAllowancePerDay,
+                callFreeSecondsUsedToday: callFreeSnapshot.callFreeSecondsUsedToday,
+                callFreeSecondsRemainingToday:
+                  callFreeSnapshot.callFreeSecondsRemainingToday,
+              }
+            : {}),
           wallet:
             walletToResponseJson(w) ?? {
               deviceId,
@@ -366,6 +629,11 @@ function processCallChargeSettle(coins, body, tariff) {
     };
   }
 
+  const w = coinsRepo.getWallet(deviceId);
+  const settleKey = `call:${callSessionId}:settle`;
+  const releaseKey = `call:${callSessionId}:release`;
+  const debitEntry = coinsRepo.getLedgerEntryByIdempotencyKey(settleKey);
+  const rel = coinsRepo.getLedgerEntryByIdempotencyKey(releaseKey);
   return {
     status: 200,
     json: {
@@ -374,14 +642,31 @@ function processCallChargeSettle(coins, body, tariff) {
       callSessionId,
       callType,
       billedSeconds: bs,
-      tariffVersion: tariff.version,
+      tariffVersion: tariff ? tariff.version : undefined,
       releasedReserveCoins: releaseCoins,
       finalDebitCoins: debitCoins,
-      wallet: walletToResponseJson(r.wallet),
-      releaseEntry: r.releaseEntry
-        ? ledgerEntryToResponseJson(r.releaseEntry)
-        : null,
-      debitEntry: r.debitEntry ? ledgerEntryToResponseJson(r.debitEntry) : null,
+      freeSecondsApplied,
+      coinBillableSeconds,
+      ...(callFreeSnapshot
+        ? {
+            usageUtcDate: callFreeSnapshot.usageUtcDate,
+            callFreeSecondsAllowancePerDay:
+              callFreeSnapshot.callFreeSecondsAllowancePerDay,
+            callFreeSecondsUsedToday: callFreeSnapshot.callFreeSecondsUsedToday,
+            callFreeSecondsRemainingToday:
+              callFreeSnapshot.callFreeSecondsRemainingToday,
+          }
+        : {}),
+      wallet:
+        walletToResponseJson(w) ?? {
+          deviceId,
+          availableCoins: 0,
+          reservedCoins: 0,
+          spendableCoins: 0,
+          updatedAt: null,
+        },
+      releaseEntry: rel ? ledgerEntryToResponseJson(rel) : null,
+      debitEntry: debitEntry ? ledgerEntryToResponseJson(debitEntry) : null,
     },
   };
 }

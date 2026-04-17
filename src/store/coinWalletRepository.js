@@ -578,6 +578,19 @@ function createCoinWalletRepository(db) {
    * @param {{ limit?: number }} [opts]
    * @returns {Array<ReturnType<typeof mapLedgerRow>>}
    */
+  /**
+   * @param {string} key
+   * @returns {ReturnType<typeof mapLedgerRow> | null}
+   */
+  function getLedgerEntryByIdempotencyKey(key) {
+    const k = normalizeIdempotencyKey(key);
+    if (!k) {
+      return null;
+    }
+    const row = selectLedgerByKey.get(k);
+    return row ? mapLedgerRow(row) : null;
+  }
+
   function listLedgerEntries(deviceId, opts = {}) {
     const dev = normalizeDeviceId(deviceId);
     if (!dev) {
@@ -793,6 +806,7 @@ function createCoinWalletRepository(db) {
     applyReserveHold,
     applyReserveRelease,
     applyCallSessionSettlement,
+    getLedgerEntryByIdempotencyKey,
     listLedgerEntries,
   };
 }

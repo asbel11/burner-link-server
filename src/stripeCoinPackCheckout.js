@@ -7,7 +7,13 @@ const { getCoinPackById, getCoinPackCatalog } = require("./coinPackCatalog");
 
 /**
  * @param {import("stripe").Stripe} stripe
- * @param {{ deviceId: unknown, packId: unknown, successUrl?: unknown, cancelUrl?: unknown }} params
+ * @param {{
+ *   deviceId: unknown,
+ *   packId: unknown,
+ *   successUrl?: unknown,
+ *   cancelUrl?: unknown,
+ *   checkoutReturnNonce?: unknown,
+ * }} params
  */
 async function createCoinPackCheckoutSession(stripe, params) {
   const deviceId =
@@ -27,7 +33,8 @@ async function createCoinPackCheckoutSession(stripe, params) {
       ok: false,
       reason: "coin_packs_not_configured",
       httpStatus: 503,
-      hint: "Set CONNECT_COIN_PACKS_JSON with at least one pack",
+      hint:
+        "Set CONNECT_COIN_PACKS_JSON and/or STRIPE_PRICE_COINS_100 / _300 / _1000 (or STRIPE_PRICE_100 / _300 / _1000)",
     };
   }
 
@@ -47,6 +54,13 @@ async function createCoinPackCheckoutSession(stripe, params) {
     connectBilling: "coin_pack",
     coinsGranted: String(pack.coins),
   };
+  const nonce =
+    typeof params.checkoutReturnNonce === "string"
+      ? params.checkoutReturnNonce.trim()
+      : "";
+  if (nonce) {
+    metadata.checkoutReturnNonce = nonce;
+  }
 
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
@@ -66,6 +80,7 @@ async function createCoinPackCheckoutSession(stripe, params) {
     url: session.url,
     packId: pack.packId,
     coins: pack.coins,
+    ...(nonce ? { checkoutReturnNonce: nonce } : {}),
   };
 }
 

@@ -32,6 +32,10 @@ If unset or invalid JSON / invalid shape → **`GET`** tariff helpers return **`
 
 Caps: estimated seconds and **`billedSeconds`** are bounded (see **`src/connectCallTariff.js`**).
 
+## Daily free seconds (before coins)
+
+See **`docs/connect-call-free-allowance.md`**. **`call-charge/start`** reserves coins only for estimated duration **after** today’s free pool; **`settle`** applies **`billedSeconds`** to free usage first, then coins. **`GET /v2/billing/wallet`** includes **`callFreeSecondsRemainingToday`** (and related fields) for UI.
+
 ## Reserve vs final debit
 
 | Concept | Meaning |
@@ -90,3 +94,4 @@ Global uniqueness: same key cannot be reused for a **different** `deviceId` ( **
 - **`docs/connect-livekit-token.md`** — **`POST /v2/calls/livekit-token`** (media access after billing start)  
 - **`docs/v2-coin-wallet-billing.md`** — coin packs + simple **`spend-coins`**  
 - **`docs/connect-server-environment.md`** — env variable names  
+- **`docs/connect-call-free-allowance.md`** — daily free seconds before coin metering  

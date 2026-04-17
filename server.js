@@ -98,6 +98,111 @@ function isValidDeviceId(deviceId) {
   return typeof deviceId === "string" && deviceId.trim().length > 0;
 }
 
+/**
+ * Wallet JSON: coin balances first (authoritative), then device + free-allowance snapshot.
+ * @param {string} trimmedDeviceId
+ * @param {{ deviceId: string, availableCoins: number, reservedCoins: number, spendableCoins: number, updatedAt: number } | null} row
+ * @param {Record<string, unknown>} freeSnap
+ */
+function buildWalletResponseJson(trimmedDeviceId, row, freeSnap) {
+  return {
+    spendableCoins: row ? row.spendableCoins : 0,
+    reservedCoins: row ? row.reservedCoins : 0,
+    availableCoins: row ? row.availableCoins : 0,
+    deviceId: trimmedDeviceId,
+    updatedAt: row ? new Date(row.updatedAt).toISOString() : null,
+    ...freeSnap,
+  };
+}
+
+/**
+ * @param {import("express").Request} req
+ * @param {import("express").Response} res
+ * @param {{ useAppCoinPackReturnUrls?: boolean }} options
+ */
+async function handleCreateCoinPackCheckoutSession(req, res, options = {}) {
+  try {
+    const useAppReturn = options.useAppCoinPackReturnUrls === true;
+    const body = req.body || {};
+    const { deviceId, packId, successUrl, cancelUrl } = body;
+    if (!isValidDeviceId(deviceId)) {
+      return res.status(400).json({ error: "Missing or invalid deviceId" });
+    }
+    if (!packId || typeof packId !== "string" || !packId.trim()) {
+      return res.status(400).json({
+        error: "Missing or invalid packId",
+        reason: "invalid_pack_id",
+      });
+    }
+
+    const stripe = getStripeApiClient();
+    if (!stripe) {
+      return res.status(503).json({
+        error: "Stripe API is not configured (set STRIPE_SECRET_KEY)",
+        reason: "stripe_not_configured",
+      });
+    }
+
+    /** @type {{ deviceId: string, packId: string, successUrl?: unknown, cancelUrl?: unknown, checkoutReturnNonce?: string }} */
+    const payload = {
+      deviceId: deviceId.trim(),
+      packId: packId.trim(),
+    };
+    if (useAppReturn) {
+      const nonce = crypto.randomBytes(16).toString("hex");
+      const cr = encodeURIComponent(nonce);
+      payload.successUrl = `app://coin-pack-return?status=success&cr=${cr}`;
+      payload.cancelUrl = `app://coin-pack-return?status=cancel&cr=${cr}`;
+      payload.checkoutReturnNonce = nonce;
+    } else {
+      payload.successUrl = successUrl;
+      payload.cancelUrl = cancelUrl;
+    }
+
+    const out = await createCoinPackCheckoutSession(stripe, payload);
+
+    if (!out.ok) {
+      if (out.reason === "coin_packs_not_configured") {
+        return res.status(503).json({
+          error:
+            "Coin packs are not configured (set CONNECT_COIN_PACKS_JSON or STRIPE_PRICE_COINS_* / STRIPE_PRICE_* env vars)",
+          reason: "coin_packs_not_configured",
+          hint: out.hint,
+        });
+      }
+      if (out.reason === "unknown_pack_id") {
+        return res.status(400).json({
+          error: "Unknown packId",
+          reason: "unknown_pack_id",
+        });
+      }
+      if (out.reason === "missing_checkout_urls") {
+        return res.status(400).json({
+          error:
+            "Provide successUrl and cancelUrl in the JSON body, or set STRIPE_CHECKOUT_SUCCESS_URL and STRIPE_CHECKOUT_CANCEL_URL",
+          reason: "missing_checkout_urls",
+        });
+      }
+      if (out.reason === "invalid_device_id" || out.reason === "invalid_pack_id") {
+        return res.status(400).json({
+          error: "Missing or invalid deviceId or packId",
+          reason: out.reason,
+        });
+      }
+      return res.status(out.httpStatus || 400).json({
+        error: "Coin checkout session could not be created",
+        reason: out.reason,
+      });
+    }
+
+    const { ok: _ok, ...responseBody } = out;
+    return res.status(200).json(responseBody);
+  } catch (err) {
+    console.error("Error in coin pack checkout session:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+}
+
 // ---------- Session routes ----------
 
 // Create a new session from a 6-digit code
@@ -839,74 +944,17 @@ app.get("/v2/billing/membership", (req, res) => {
 });
 
 // CONNECT coin pack checkout (one-time payment — Phase Coins-3)
-app.post("/v2/billing/create-coin-checkout-session", async (req, res) => {
-  try {
-    const { deviceId, packId, successUrl, cancelUrl } = req.body || {};
-    if (!isValidDeviceId(deviceId)) {
-      return res.status(400).json({ error: "Missing or invalid deviceId" });
-    }
-    if (!packId || typeof packId !== "string" || !packId.trim()) {
-      return res.status(400).json({
-        error: "Missing or invalid packId",
-        reason: "invalid_pack_id",
-      });
-    }
+app.post("/v2/billing/create-coin-checkout-session", (req, res) => {
+  return handleCreateCoinPackCheckoutSession(req, res, {
+    useAppCoinPackReturnUrls: false,
+  });
+});
 
-    const stripe = getStripeApiClient();
-    if (!stripe) {
-      return res.status(503).json({
-        error: "Stripe API is not configured (set STRIPE_SECRET_KEY)",
-        reason: "stripe_not_configured",
-      });
-    }
-
-    const out = await createCoinPackCheckoutSession(stripe, {
-      deviceId: deviceId.trim(),
-      packId: packId.trim(),
-      successUrl,
-      cancelUrl,
-    });
-
-    if (!out.ok) {
-      if (out.reason === "coin_packs_not_configured") {
-        return res.status(503).json({
-          error:
-            "Coin packs are not configured (set CONNECT_COIN_PACKS_JSON)",
-          reason: "coin_packs_not_configured",
-          hint: out.hint,
-        });
-      }
-      if (out.reason === "unknown_pack_id") {
-        return res.status(400).json({
-          error: "Unknown packId",
-          reason: "unknown_pack_id",
-        });
-      }
-      if (out.reason === "missing_checkout_urls") {
-        return res.status(400).json({
-          error:
-            "Provide successUrl and cancelUrl in the JSON body, or set STRIPE_CHECKOUT_SUCCESS_URL and STRIPE_CHECKOUT_CANCEL_URL",
-          reason: "missing_checkout_urls",
-        });
-      }
-      if (out.reason === "invalid_device_id" || out.reason === "invalid_pack_id") {
-        return res.status(400).json({
-          error: "Missing or invalid deviceId or packId",
-          reason: out.reason,
-        });
-      }
-      return res.status(out.httpStatus || 400).json({
-        error: "Coin checkout session could not be created",
-        reason: out.reason,
-      });
-    }
-
-    const { ok: _ok, ...body } = out;
-    return res.status(200).json(body);
-  } catch (err) {
-    console.error("Error in POST /v2/billing/create-coin-checkout-session:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
+// Mobile coin pack checkout — deep-link return URLs (Billing-System-Complete-1)
+app.post("/v2/billing/coin-pack/create-checkout", (req, res) => {
+  return handleCreateCoinPackCheckoutSession(req, res, {
+    useAppCoinPackReturnUrls: true,
+  });
 });
 
 // CONNECT prepaid coin wallet (device-bound — Phase Coins-3)
@@ -918,22 +966,10 @@ app.get("/v2/billing/wallet", (req, res) => {
     }
     const trimmed = deviceId.trim();
     const row = store.coins.getWallet(trimmed);
-    if (!row) {
-      return res.status(200).json({
-        deviceId: trimmed,
-        availableCoins: 0,
-        reservedCoins: 0,
-        spendableCoins: 0,
-        updatedAt: null,
-      });
-    }
-    return res.status(200).json({
-      deviceId: row.deviceId,
-      availableCoins: row.availableCoins,
-      reservedCoins: row.reservedCoins,
-      spendableCoins: row.spendableCoins,
-      updatedAt: new Date(row.updatedAt).toISOString(),
-    });
+    const freeSnap = store.callFree.getSnapshot(trimmed);
+    return res
+      .status(200)
+      .json(buildWalletResponseJson(trimmed, row, freeSnap));
   } catch (err) {
     console.error("Error in GET /v2/billing/wallet:", err);
     return res.status(500).json({ error: "Internal server error" });
@@ -955,7 +991,9 @@ app.post("/v2/billing/spend-coins", (req, res) => {
 app.post("/v2/billing/call-charge/start", (req, res) => {
   try {
     const tariff = getCallTariffFromEnv();
-    const out = processCallChargeStart(store.coins, req.body || {}, tariff);
+    const out = processCallChargeStart(store.coins, req.body || {}, tariff, {
+      callFree: store.callFree,
+    });
     return res.status(out.status).json(out.json);
   } catch (err) {
     console.error("Error in POST /v2/billing/call-charge/start:", err);
@@ -966,7 +1004,10 @@ app.post("/v2/billing/call-charge/start", (req, res) => {
 app.post("/v2/billing/call-charge/settle", (req, res) => {
   try {
     const tariff = getCallTariffFromEnv();
-    const out = processCallChargeSettle(store.coins, req.body || {}, tariff);
+    const out = processCallChargeSettle(store.coins, req.body || {}, tariff, {
+      db: store.db,
+      callFree: store.callFree,
+    });
     return res.status(out.status).json(out.json);
   } catch (err) {
     console.error("Error in POST /v2/billing/call-charge/settle:", err);

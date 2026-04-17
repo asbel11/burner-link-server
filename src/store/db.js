@@ -236,6 +236,7 @@ function openDatabase(dbFilePath) {
   migrateRetentionPurchasesIdempotency(db);
   migrateDeviceMembership(db);
   migrateCoinWallet(db);
+  migrateCallFreeAllowance(db);
   migrateMutualSave(db);
   migrateRoomMemberLiveChatPresence(db);
 
@@ -374,6 +375,24 @@ function migrateDeviceMembership(db) {
  * Phase Coins-2 — prepaid coin wallet + append-only ledger (`deviceId`-bound).
  * @see docs/connect-coins-wallet-design.md
  */
+/**
+ * Daily free call seconds per device (UTC calendar day). Billing consumes here before coins.
+ * @see docs/connect-call-free-allowance.md
+ */
+function migrateCallFreeAllowance(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS device_daily_call_free_usage (
+      device_id TEXT NOT NULL,
+      usage_utc_date TEXT NOT NULL,
+      free_seconds_used INTEGER NOT NULL DEFAULT 0 CHECK (free_seconds_used >= 0),
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (device_id, usage_utc_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_call_free_device_date
+      ON device_daily_call_free_usage (device_id, usage_utc_date);
+  `);
+}
+
 function migrateCoinWallet(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS device_coin_wallets (

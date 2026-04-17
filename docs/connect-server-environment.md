@@ -86,8 +86,9 @@ See **`docs/v2-mutual-save.md`**.
 |----------|----------|---------|
 | **`CONNECT_CALL_TARIFF_JSON`** | **Yes** (for these routes) | JSON object: **`version`**, **`voice.coinsPerSecond`**, **`video.coinsPerSecond`** (non-negative integers). Invalid or missing → **`503`** `tariff_not_configured`. |
 | **`CONNECT_CALL_DEFAULT_MIN_HOLD_SECONDS`** | No | Default **`estimatedBillableSeconds`** when omitted on **start** (default **`120`**). |
+| **`CONNECT_FREE_CALL_SECONDS_PER_DAY`** | No | Daily free **call** seconds per **`deviceId`** (UTC day) before coin metering (default **`180`**). Set **`0`** to disable. |
 
-See **`docs/connect-call-charging.md`**.
+See **`docs/connect-call-charging.md`** and **`docs/connect-call-free-allowance.md`**.
 
 ## LiveKit media (`POST /v2/calls/livekit-token`)
 

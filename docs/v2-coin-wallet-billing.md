@@ -78,11 +78,15 @@ Unknown **`packId`** (not in catalog) → **`400`** `invalid_pack_id`.
   "availableCoins": 0,
   "reservedCoins": 0,
   "spendableCoins": 0,
-  "updatedAt": null
+  "updatedAt": null,
+  "usageUtcDate": "2026-04-16",
+  "callFreeSecondsAllowancePerDay": 180,
+  "callFreeSecondsUsedToday": 0,
+  "callFreeSecondsRemainingToday": 180
 }
 ```
 
-**`200` when wallet exists:** same shape with real balances and **`updatedAt`** as ISO-8601 from server time.
+**`200` when wallet exists:** same coin balance fields with **`updatedAt`** as ISO-8601, plus the **`callFree*`** / **`usageUtcDate`** fields above (see **`docs/connect-call-free-allowance.md`**). **Do not** compute free usage on the client.
 
 ## `POST /v2/billing/spend-coins` (Phase Call-Meter-1)
 

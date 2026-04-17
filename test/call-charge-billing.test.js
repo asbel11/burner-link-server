@@ -11,6 +11,7 @@ const {
   processCallChargeStart,
   processCallChargeSettle,
 } = require("../src/connectCallBilling");
+const { createCallFreeAllowance } = require("../src/callFreeAllowance");
 
 const TARIFF = Object.freeze({
   version: 2,
@@ -150,17 +151,28 @@ describe("applyCallSessionSettlement (repo)", () => {
 describe("processCallChargeStart / Settle (handlers)", () => {
   let dbPath;
   let coins;
+  let db;
+  let callFree;
+  let prevFreeDay;
 
   before(() => {
     dbPath = path.join(
       os.tmpdir(),
       `burner-call-hand-${Date.now()}-${Math.random().toString(16).slice(2)}.db`
     );
-    const db = openDatabase(dbPath);
+    prevFreeDay = process.env.CONNECT_FREE_CALL_SECONDS_PER_DAY;
+    process.env.CONNECT_FREE_CALL_SECONDS_PER_DAY = "0";
+    db = openDatabase(dbPath);
     coins = createCoinWalletRepository(db);
+    callFree = createCallFreeAllowance(db);
   });
 
   after(() => {
+    if (prevFreeDay === undefined) {
+      delete process.env.CONNECT_FREE_CALL_SECONDS_PER_DAY;
+    } else {
+      process.env.CONNECT_FREE_CALL_SECONDS_PER_DAY = prevFreeDay;
+    }
     try {
       fs.unlinkSync(dbPath);
     } catch (_) {
@@ -196,7 +208,8 @@ describe("processCallChargeStart / Settle (handlers)", () => {
         callType: "voice",
         estimatedBillableSeconds: 60,
       },
-      TARIFF
+      TARIFF,
+      { callFree }
     );
     assert.equal(out.status, 200);
     assert.equal(out.json.reservedCoins, 60);
@@ -216,7 +229,8 @@ describe("processCallChargeStart / Settle (handlers)", () => {
         callType: "voice",
         estimatedBillableSeconds: 99999,
       },
-      TARIFF
+      TARIFF,
+      { callFree }
     );
     assert.equal(out.status, 402);
     assert.equal(out.json.reason, "insufficient_funds");
@@ -234,7 +248,8 @@ describe("processCallChargeStart / Settle (handlers)", () => {
         callType: "voice",
         estimatedBillableSeconds: 100,
       },
-      TARIFF
+      TARIFF,
+      { callFree }
     );
     const out = processCallChargeSettle(
       coins,
@@ -245,7 +260,8 @@ describe("processCallChargeStart / Settle (handlers)", () => {
         billedSeconds: 10,
         reservedAmount: 100,
       },
-      TARIFF
+      TARIFF,
+      { db, callFree }
     );
     assert.equal(out.status, 200);
     assert.equal(out.json.finalDebitCoins, 10);
@@ -266,7 +282,8 @@ describe("processCallChargeStart / Settle (handlers)", () => {
         callType: "voice",
         estimatedBillableSeconds: 50,
       },
-      TARIFF
+      TARIFF,
+      { callFree }
     );
     const out = processCallChargeSettle(
       coins,
@@ -277,7 +294,8 @@ describe("processCallChargeStart / Settle (handlers)", () => {
         billedSeconds: 400,
         reservedAmount: 50,
       },
-      TARIFF
+      TARIFF,
+      { db, callFree }
     );
     assert.equal(out.status, 200);
     assert.equal(out.json.finalDebitCoins, 400);
@@ -295,8 +313,8 @@ describe("processCallChargeStart / Settle (handlers)", () => {
       billedSeconds: 5,
       reservedAmount: 0,
     };
-    const a = processCallChargeSettle(coins, body, TARIFF);
-    const b = processCallChargeSettle(coins, body, TARIFF);
+    const a = processCallChargeSettle(coins, body, TARIFF, { db, callFree });
+    const b = processCallChargeSettle(coins, body, TARIFF, { db, callFree });
     assert.equal(a.status, 200);
     assert.equal(a.json.duplicate, false);
     assert.equal(b.status, 200);
@@ -347,6 +365,7 @@ describe("POST /v2/billing/call-charge/* (HTTP)", () => {
   let app;
   let prevDb;
   let prevTariff;
+  let prevFreeDay;
 
   before(() => {
     dbPath = path.join(
@@ -355,7 +374,9 @@ describe("POST /v2/billing/call-charge/* (HTTP)", () => {
     );
     prevDb = process.env.DATABASE_PATH;
     prevTariff = process.env.CONNECT_CALL_TARIFF_JSON;
+    prevFreeDay = process.env.CONNECT_FREE_CALL_SECONDS_PER_DAY;
     process.env.DATABASE_PATH = dbPath;
+    process.env.CONNECT_FREE_CALL_SECONDS_PER_DAY = "0";
     process.env.CONNECT_CALL_TARIFF_JSON = JSON.stringify({
       version: 1,
       voice: { coinsPerSecond: 2 },
@@ -379,6 +400,11 @@ describe("POST /v2/billing/call-charge/* (HTTP)", () => {
     else process.env.DATABASE_PATH = prevDb;
     if (prevTariff === undefined) delete process.env.CONNECT_CALL_TARIFF_JSON;
     else process.env.CONNECT_CALL_TARIFF_JSON = prevTariff;
+    if (prevFreeDay === undefined) {
+      delete process.env.CONNECT_FREE_CALL_SECONDS_PER_DAY;
+    } else {
+      process.env.CONNECT_FREE_CALL_SECONDS_PER_DAY = prevFreeDay;
+    }
     delete require.cache[require.resolve("../server.js")];
     try {
       fs.unlinkSync(dbPath);
