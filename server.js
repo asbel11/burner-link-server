@@ -426,7 +426,7 @@ app.get("/messages/:sessionId", (req, res) => {
   res.json(session.messages);
 });
 
-// Post a new message (text, image, or attachment-backed image/video/file)
+// Post a new message (text, image, attachment-backed media, or screenshot in-room event)
 app.post("/messages", (req, res) => {
   const { sessionId, senderId, encrypted, type, fileName, attachmentId } =
     req.body || {};
@@ -444,6 +444,7 @@ app.post("/messages", (req, res) => {
   if (type === "image") msgType = "image";
   else if (type === "video") msgType = "video";
   else if (type === "file") msgType = "file";
+  else if (type === "screenshot_event") msgType = "screenshot_event";
 
   const id = createId();
 
@@ -471,6 +472,12 @@ app.post("/messages", (req, res) => {
       return res.status(400).json({
         error: "Invalid encrypted payload shape or fileName",
         reason: "invalid_payload",
+      });
+    }
+    if (inserted.reason === "screenshot_event_no_attachments") {
+      return res.status(400).json({
+        error: "screenshot_event must not include attachmentId",
+        reason: "screenshot_event_no_attachments",
       });
     }
     if (inserted.reason === "attachments_not_configured") {
@@ -745,6 +752,7 @@ app.post("/v2/rooms/:roomId/messages", (req, res) => {
     if (type === "image") msgType = "image";
     else if (type === "video") msgType = "video";
     else if (type === "file") msgType = "file";
+    else if (type === "screenshot_event") msgType = "screenshot_event";
 
     const id = createId();
     const inserted = store.rooms.appendMessageForLinkedDevice({
@@ -772,6 +780,12 @@ app.post("/v2/rooms/:roomId/messages", (req, res) => {
         return res.status(400).json({
           error: "Invalid encrypted payload shape or fileName",
           reason: "invalid_payload",
+        });
+      }
+      if (inserted.reason === "screenshot_event_no_attachments") {
+        return res.status(400).json({
+          error: "screenshot_event must not include attachmentId",
+          reason: "screenshot_event_no_attachments",
         });
       }
       if (inserted.reason === "attachments_not_configured") {

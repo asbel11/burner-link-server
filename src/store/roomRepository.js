@@ -44,6 +44,8 @@ function mapMessageRow(row) {
   let type = "text";
   if (mt === "image" || mt === "video" || mt === "file") {
     type = mt;
+  } else if (mt === "screenshot_event") {
+    type = "screenshot_event";
   } else if (mt === "text") {
     type = "text";
   }
@@ -1006,6 +1008,12 @@ function createRoomRepository(db, opts = {}) {
     fileName,
     attachmentId,
   }) {
+    if (type === "screenshot_event") {
+      if (attachmentId != null && String(attachmentId).trim() !== "") {
+        return { ok: false, reason: "screenshot_event_no_attachments" };
+      }
+    }
+
     let attRow = null;
     if (attachmentId != null && String(attachmentId).trim() !== "") {
       const aid = String(attachmentId).trim();
@@ -1035,7 +1043,11 @@ function createRoomRepository(db, opts = {}) {
     }
 
     const wantType =
-      type === "image" || type === "video" || type === "file" ? type : "text";
+      type === "image" || type === "video" || type === "file"
+        ? type
+        : type === "screenshot_event"
+          ? "screenshot_event"
+          : "text";
     if (
       (wantType === "video" || wantType === "file") &&
       !attRow
@@ -1055,9 +1067,11 @@ function createRoomRepository(db, opts = {}) {
 
     const msgTypeStored = attRow
       ? attRow.kind
-      : type === "image"
-        ? "image"
-        : "text";
+      : type === "screenshot_event"
+        ? "screenshot_event"
+        : type === "image"
+          ? "image"
+          : "text";
 
     const t = nowMs();
     const tx = db.transaction(() => {
@@ -1097,9 +1111,11 @@ function createRoomRepository(db, opts = {}) {
 
     const displayType = attRow
       ? attRow.kind
-      : type === "image"
-        ? "image"
-        : "text";
+      : type === "screenshot_event"
+        ? "screenshot_event"
+        : type === "image"
+          ? "image"
+          : "text";
 
     return {
       ok: true,

@@ -56,7 +56,7 @@ Reads use **`listMessagesForDeviceRoom`** — same rows as V1, different visibil
 |-------|----------|--------|
 | `deviceId` | yes | Must have **`device_room_links`** row for `(roomId, deviceId)` |
 | `encrypted` | yes | `{ ciphertext: string, nonce: string }` — **same as V1** |
-| `type` | no | `"text"` (default) or `"image"` |
+| `type` | no | `"text"` (default), `"image"`, `"video"`, `"file"`, or **`"screenshot_event"`** (in-room event; no `attachmentId`) — see **`docs/v2-screenshot-event.md`** |
 | `fileName` | no | optional |
 | `senderId` | no | If omitted, **`senderId` stored = `deviceId`**. If set, **must equal `deviceId`** (trimmed) |
 

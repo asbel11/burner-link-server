@@ -151,6 +151,8 @@ If the **merged** catalog is empty → **`503`** `coin_packs_not_configured`.
 
 ## Call charging (`POST /v2/billing/call-charge/start` and `.../settle`)
 
+**Railway / production checklist, exact 503 body, smoke `curl`:** **`docs/call-tariff-ops-railway.md`**.
+
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | **`CONNECT_CALL_TARIFF_JSON`** | **Yes** (for these routes) | JSON object: **`version`**, **`voice.coinsPerSecond`**, **`video.coinsPerSecond`** (non-negative integers). Invalid or missing → **`503`** `tariff_not_configured`. For **voice-only** public launch, set **`video.coinsPerSecond`** to **`0`** (field is still required by the parser). |
