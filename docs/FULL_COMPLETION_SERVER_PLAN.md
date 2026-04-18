@@ -11,7 +11,7 @@ Scope: **server repo only**; mobile out of band. Baseline: 1:1 chat, billing, vo
 | **Inline E2EE messages (text + image type)** | **Complete** | — | Maintain; payload limits added (**`messagePayloadLimits`**) | Crypto + UX | — |
 | **Media at scale (photos/videos/files)** | **Server complete (Media-Storage-1)** | — | Maintain **`room_attachments`**, S3 presigns, **`attachment_id`** on messages, burn delete; optional: CDN, scan | Client upload/finalize/message/download UX | **P1** (mobile) |
 | **Message payload abuse / DB growth** | **Improved (P0)** | Was unbounded field length | **`CONNECT_MESSAGE_MAX_*`** + validation + **413** / **400** | None | **P0** (done) |
-| **Group rooms** | **Absent** | **`MAX_V1_DEVICES_PER_ROOM = 2`** | **P2:** schema (`room_type`, raise cap), join rules, list/detail, messages authz, LiveKit N-way, billing — large design | Full UX | **P2** (plan only unless product greenlights) |
+| **Group rooms** | **Server foundation done; product partial** | Direct cap 2 unchanged; **`room_kind` / `member_cap`**, **`POST /v2/rooms/create`**, join by cap — see **`docs/v2-group-rooms.md`** | **P2:** LiveKit N-way, group UX, billing rules, doc alignment | Full UX | **P2** |
 | **Retention enforcement (TTL)** | **Not enforced** | Advisory `retention_until` only | **P1+:** background job + delete strategy + list API contract | Inbox expectations | **P1** |
 | **Voice calls** | **Complete for voice** | — | Keep stable | Call UI | — |
 | **Video calls** | **Disabled** | **`livekit-token`** rejects non-voice; grants mic only | **Decision:** enable **`callType: video`**, **`TrackSource.CAMERA`**, tariff alignment — **P1** if product wants | Video UI | **P1** (product gate) |
